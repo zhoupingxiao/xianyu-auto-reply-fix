@@ -131,6 +131,26 @@
   line-height: 1.2;
 }
 
+/* 销售额加载状态样式 */
+.sales-value-loading {
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--secondary-color);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* 销售额错误状态样式 */
+.sales-value-error {
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--danger-color);
+}
+
 /* 时间范围选择器样式 */
 .time-range-selector {
   display: flex;

@@ -1279,7 +1279,7 @@ async def get_sales_summary(
     user_info: Optional[Dict[str, Any]] = Depends(verify_token)
 ):
     """
-    获取本周和本月销售额摘要
+    获取当日、本周和本月销售额摘要
     """
     try:
         from db_manager import db_manager
@@ -1287,6 +1287,9 @@ async def get_sales_summary(
         
         # 计算时间范围
         now = datetime.now()
+        
+        # 当日开始
+        today_start_str = now.strftime('%Y-%m-%d')
         
         # 本周开始（周一）
         week_start = now - timedelta(days=now.weekday())
@@ -1301,6 +1304,7 @@ async def get_sales_summary(
         all_orders = db_manager.execute_query(query, [month_start_str])
         
         # 计算销售额
+        today_sales = 0.0
         week_sales = 0.0
         month_sales = 0.0
         
@@ -1319,15 +1323,21 @@ async def get_sales_summary(
                 # 检查是否在本周
                 if created_at >= week_start_str:
                     week_sales += amount
+                
+                # 检查是否在当日
+                if created_at >= today_start_str:
+                    today_sales += amount
             except (ValueError, TypeError):
                 continue
         
+        today_sales = round(today_sales, 2)
         week_sales = round(week_sales, 2)
         month_sales = round(month_sales, 2)
         
         return {
             'success': True,
             'data': {
+                'today_sales': today_sales,
                 'week_sales': week_sales,
                 'month_sales': month_sales,
                 'update_time': now.strftime('%Y-%m-%d %H:%M:%S')

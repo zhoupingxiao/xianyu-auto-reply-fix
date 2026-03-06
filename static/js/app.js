@@ -460,8 +460,21 @@ async function loadOrderDashboardMetrics() {
     }
 }
 
+// 销售额摘要定时刷新定时器
+let salesSummaryRefreshTimer = null;
+
 // 加载销售额摘要数据
 async function loadSalesSummary() {
+    const todaySalesEl = document.getElementById('dashboardTodaySales');
+    const weekSalesEl = document.getElementById('dashboardWeekSales');
+    const monthSalesEl = document.getElementById('dashboardMonthSales');
+    const updateTimeEl = document.getElementById('dashboardSalesUpdateTime');
+    
+    // 显示加载状态
+    showSalesLoadingState(todaySalesEl);
+    showSalesLoadingState(weekSalesEl);
+    showSalesLoadingState(monthSalesEl);
+    
     try {
         const token = localStorage.getItem('auth_token');
         const response = await fetch('/api/sales/summary', {
@@ -473,28 +486,105 @@ async function loadSalesSummary() {
         const data = await response.json();
         if (data.success && data.data) {
             updateDashboardSalesMetrics(data.data);
+        } else {
+            showSalesErrorState(todaySalesEl, '获取失败');
+            showSalesErrorState(weekSalesEl, '获取失败');
+            showSalesErrorState(monthSalesEl, '获取失败');
         }
     } catch (error) {
         console.error('加载销售额摘要失败:', error);
+        showSalesErrorState(todaySalesEl, '加载失败');
+        showSalesErrorState(weekSalesEl, '加载失败');
+        showSalesErrorState(monthSalesEl, '加载失败');
     }
+    
+    // 启动定时刷新（每5分钟刷新一次）
+    startSalesSummaryRefreshTimer();
+}
+
+// 显示销售额加载状态
+function showSalesLoadingState(element) {
+    if (element) {
+        element.innerHTML = '<span class="sales-value-loading">加载中...</span>';
+    }
+}
+
+// 显示销售额错误状态
+function showSalesErrorState(element, message) {
+    if (element) {
+        element.innerHTML = `<span class="sales-value-error">${message}</span>`;
+    }
+}
+
+// 格式化销售额显示（带千分位分隔符）
+function formatSalesAmount(amount) {
+    return amount.toLocaleString('zh-CN', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    });
 }
 
 // 更新销售额指标
 function updateDashboardSalesMetrics(metrics) {
+    const todaySalesEl = document.getElementById('dashboardTodaySales');
     const weekSalesEl = document.getElementById('dashboardWeekSales');
     const monthSalesEl = document.getElementById('dashboardMonthSales');
     const updateTimeEl = document.getElementById('dashboardSalesUpdateTime');
 
+    if (todaySalesEl) {
+        todaySalesEl.innerHTML = `￥${formatSalesAmount(metrics.today_sales)}`;
+    }
+
     if (weekSalesEl) {
-        weekSalesEl.textContent = `￥${metrics.week_sales.toFixed(2)}`;
+        weekSalesEl.innerHTML = `￥${formatSalesAmount(metrics.week_sales)}`;
     }
 
     if (monthSalesEl) {
-        monthSalesEl.textContent = `￥${metrics.month_sales.toFixed(2)}`;
+        monthSalesEl.innerHTML = `￥${formatSalesAmount(metrics.month_sales)}`;
     }
 
     if (updateTimeEl) {
         updateTimeEl.textContent = metrics.update_time;
+    }
+}
+
+// 启动销售额摘要定时刷新
+function startSalesSummaryRefreshTimer() {
+    // 清除现有定时器
+    if (salesSummaryRefreshTimer) {
+        clearInterval(salesSummaryRefreshTimer);
+    }
+    
+    // 每5分钟刷新一次
+    salesSummaryRefreshTimer = setInterval(async () => {
+        try {
+            const token = localStorage.getItem('auth_token');
+            if (!token) {
+                clearInterval(salesSummaryRefreshTimer);
+                return;
+            }
+            
+            const response = await fetch('/api/sales/summary', {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+
+            const data = await response.json();
+            if (data.success && data.data) {
+                updateDashboardSalesMetrics(data.data);
+            }
+        } catch (error) {
+            console.error('定时刷新销售额摘要失败:', error);
+        }
+    }, 5 * 60 * 1000); // 5分钟
+}
+
+// 停止销售额摘要定时刷新
+function stopSalesSummaryRefreshTimer() {
+    if (salesSummaryRefreshTimer) {
+        clearInterval(salesSummaryRefreshTimer);
+        salesSummaryRefreshTimer = null;
     }
 }
 
@@ -3515,6 +3605,9 @@ function goToAutoReply(accountId) {
 
 // 登出功能
 async function logout() {
+    // 停止销售额摘要定时刷新
+    stopSalesSummaryRefreshTimer();
+    
     try {
     if (authToken) {
         await fetch('/logout', {
