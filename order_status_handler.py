@@ -423,6 +423,10 @@ class OrderStatusHandler:
         if message_hash is None and message is not None:
             message_hash = self._build_message_hash(message)
 
+        message_timestamp_ms = raw_context.get('message_timestamp_ms')
+        if message_timestamp_ms is None and message is not None:
+            message_timestamp_ms = self._extract_message_timestamp_ms(message)
+
         sid = self._normalize_match_text(raw_context.get('sid'))
         buyer_id = self._normalize_match_text(raw_context.get('buyer_id'))
         item_id = self._normalize_item_match_value(raw_context.get('item_id'))
@@ -433,6 +437,7 @@ class OrderStatusHandler:
 
         return {
             'message_hash': message_hash,
+            'message_timestamp_ms': message_timestamp_ms,
             'sid': sid,
             'buyer_id': buyer_id,
             'item_id': item_id,
@@ -458,9 +463,70 @@ class OrderStatusHandler:
             pending_msg.get('item_id') == match_context.get('item_id')
         )
 
+    def _is_terminal_pending_status(self, status: Optional[str]) -> bool:
+        return status in {'shipped', 'completed', 'cancelled', 'refund_cancelled'}
+
+    def _pending_message_matches_fields(self, pending_msg: Dict[str, Any], match_context: Dict[str, Any], fields: tuple) -> bool:
+        for field in fields:
+            expected_value = match_context.get(field)
+            if not expected_value or pending_msg.get(field) != expected_value:
+                return False
+        return True
+
+    def _is_pending_terminal_message_within_gap(self, pending_msg: Dict[str, Any], current_timestamp_ms: Optional[int]) -> bool:
+        if not self._is_terminal_pending_status(pending_msg.get('new_status')):
+            return True
+
+        pending_timestamp_ms = pending_msg.get('message_timestamp_ms')
+        if not pending_timestamp_ms or not current_timestamp_ms:
+            return False
+
+        max_gap_seconds = self.config.get('pending_terminal_bind_max_gap_seconds', 90)
+        max_gap_ms = int(max_gap_seconds * 1000)
+        gap_ms = abs(int(current_timestamp_ms) - int(pending_timestamp_ms))
+        return gap_ms <= max_gap_ms
+
+    def _select_terminal_pending_message_index(self, pending_messages: list, match_context: Dict[str, Any], queue_name: str):
+        current_timestamp_ms = match_context.get('message_timestamp_ms')
+        if not current_timestamp_ms:
+            return None, 'terminal_no_timestamp'
+
+        fallback_matchers = [
+            ('terminal_sid_item_buyer_recent', ('sid', 'item_id', 'buyer_id')),
+            ('terminal_sid_item_recent', ('sid', 'item_id')),
+            ('terminal_sid_buyer_recent', ('sid', 'buyer_id')),
+            ('terminal_sid_recent', ('sid',)),
+        ]
+
+        for mode, fields in fallback_matchers:
+            if any(not match_context.get(field) for field in fields):
+                continue
+
+            candidate_indexes = [
+                i for i, msg in enumerate(pending_messages)
+                if self._is_terminal_pending_status(msg.get('new_status'))
+                and self._pending_message_matches_fields(msg, match_context, fields)
+                and self._is_pending_terminal_message_within_gap(msg, current_timestamp_ms)
+            ]
+
+            if len(candidate_indexes) == 1:
+                return candidate_indexes[0], mode
+
+            if len(candidate_indexes) > 1:
+                logger.warning(
+                    f"{queue_name} 待处理队列终态近邻回退命中多个候选，拒绝匹配: "
+                    f"mode={mode}, candidates={len(candidate_indexes)}, "
+                    f"{self._format_pending_match_context(match_context)}"
+                )
+                return None, f'ambiguous_{mode}'
+
+        return None, 'terminal_recent_miss'
+
     def _select_pending_message_index(self, pending_messages: list, match_context: Dict[str, Any], queue_name: str):
         if not pending_messages:
             return None, 'empty'
+
+        ambiguous_reason = None
 
         message_hash = match_context.get('message_hash')
         if message_hash is not None:
@@ -482,7 +548,7 @@ class OrderStatusHandler:
                     f"{queue_name} 待处理队列出现多个 message_hash 候选，严格模式拒绝匹配: "
                     f"candidates={len(hash_candidates)}, {self._format_pending_match_context(match_context)}"
                 )
-                return None, 'ambiguous_message_hash'
+                ambiguous_reason = 'ambiguous_message_hash'
 
         if match_context.get('has_strong_match_key'):
             strong_candidates = [
@@ -496,7 +562,18 @@ class OrderStatusHandler:
                     f"{queue_name} 待处理队列出现多个强关联键候选，严格模式拒绝匹配: "
                     f"candidates={len(strong_candidates)}, {self._format_pending_match_context(match_context)}"
                 )
-                return None, 'ambiguous_strong_key'
+                ambiguous_reason = 'ambiguous_strong_key'
+
+        terminal_index, terminal_mode = self._select_terminal_pending_message_index(
+            pending_messages,
+            match_context,
+            queue_name,
+        )
+        if terminal_index is not None:
+            return terminal_index, terminal_mode
+
+        if ambiguous_reason:
+            return None, ambiguous_reason
 
         return None, 'miss'
 
@@ -605,7 +682,7 @@ class OrderStatusHandler:
         return success
 
     def _should_bind_pending_terminal_message(self, pending_msg: Dict[str, Any], message: dict) -> bool:
-        if pending_msg.get('new_status') != 'cancelled':
+        if not self._is_terminal_pending_status(pending_msg.get('new_status')):
             return True
 
         pending_timestamp_ms = pending_msg.get('message_timestamp_ms')
@@ -613,35 +690,55 @@ class OrderStatusHandler:
         if not pending_timestamp_ms or not current_timestamp_ms:
             return True
 
+        if self._is_pending_terminal_message_within_gap(pending_msg, current_timestamp_ms):
+            return True
+
         max_gap_seconds = self.config.get('pending_terminal_bind_max_gap_seconds', 90)
         max_gap_ms = int(max_gap_seconds * 1000)
-        if current_timestamp_ms - pending_timestamp_ms <= max_gap_ms:
-            return True
+        gap_ms = abs(int(current_timestamp_ms) - int(pending_timestamp_ms))
 
         logger.warning(
             "待处理终态消息与当前提取订单时间差过大，拒绝绑定以避免串单: "
-            f"gap_ms={current_timestamp_ms - pending_timestamp_ms}, max_gap_ms={max_gap_ms}"
+            f"status={pending_msg.get('new_status')}, gap_ms={gap_ms}, max_gap_ms={max_gap_ms}"
         )
         return False
+
+    def _get_terminal_resolution_statuses(self, pending_status: Optional[str]) -> list:
+        if pending_status == 'cancelled':
+            return ['cancelled']
+        if pending_status == 'refund_cancelled':
+            return ['refund_cancelled', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed']
+        if pending_status == 'shipped':
+            return ['shipped', 'completed', 'refunding', 'cancelled']
+        if pending_status == 'completed':
+            return ['completed', 'refunding', 'cancelled']
+        return []
 
     def _pending_terminal_message_already_resolved(self, order_id: str, cookie_id: str,
                                                    pending_msg: Dict[str, Any],
                                                    match_context: Dict[str, Any]) -> bool:
-        if pending_msg.get('new_status') != 'cancelled':
+        pending_status = pending_msg.get('new_status')
+        if not self._is_terminal_pending_status(pending_status):
+            return False
+
+        resolution_statuses = self._get_terminal_resolution_statuses(pending_status)
+        if not resolution_statuses:
             return False
 
         resolved_orders = self._find_recent_orders_for_match_context(
             cookie_id=cookie_id,
             match_context=match_context,
-            statuses=['cancelled'],
+            statuses=resolution_statuses,
             exclude_order_id=order_id
         )
         if not resolved_orders:
             return False
 
         logger.info(
-            "检测到同匹配键下已有其它已关闭订单，视为待处理终态消息已消化: "
-            f"current_order_id={order_id}, resolved_order_id={resolved_orders[0].get('order_id')}"
+            "检测到同匹配键下已有其它终态订单，视为待处理终态消息已消化: "
+            f"pending_status={pending_status}, current_order_id={order_id}, "
+            f"resolved_order_id={resolved_orders[0].get('order_id')}, "
+            f"resolved_status={resolved_orders[0].get('order_status')}"
         )
         return True
 
