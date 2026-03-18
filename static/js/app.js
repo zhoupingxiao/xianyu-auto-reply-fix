@@ -14987,7 +14987,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.5.0';
+const DEFAULT_VERSION = 'v1.7.0';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -15101,9 +15101,22 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.6.1',
+    version: 'v1.7.0',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.7.0',
+            date: '2026-03-19',
+            updates: [
+                '【修复】系统消息状态优先级与消息分流逻辑重构，阻止订单状态回退并减少系统通知噪音',
+                '【修复】扩展订单消息的订单号提取来源，增强 sid 兜底查单与近邻回退，减少简化消息和终态待处理消息漏单',
+                '【优化】订单详情优先采用结构化状态信号，补刷增加状态门控与冷却，降低误判和高频补刷',
+                '【修复】无规格商品规则匹配与 sid 兜底发货链路收紧，降低串单和误发风险',
+                '【修复】小刀订单新增成功证据持久化，在缺少完整待发货卡片时也能继续自动发货兜底',
+                '【修复】闲鱼币抵扣订单金额识别，优先保留或推导真实实付金额，避免把原价误判为成交价',
+                '【优化】发货日志新增“已跳过”状态，并过滤成功后的重复 skipped 记录，日志展示更清晰'
+            ]
+        },
         {
             version: 'v1.6.1',
             date: '2026-03-13',
