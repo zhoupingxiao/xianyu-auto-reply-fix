@@ -7315,6 +7315,7 @@ Cookie数量: {cookie_count}
                             return None
 
                     # 获取解析后的规格信息
+                    spec_parse_mode = str(result.get('spec_parse_mode') or '').strip() or 'no_spec'
                     spec_name = _normalize_optional_text(result.get('spec_name'))
                     spec_value = _normalize_optional_text(result.get('spec_value'))
                     spec_name_2 = _normalize_optional_text(result.get('spec_name_2'))
@@ -7341,6 +7342,14 @@ Cookie数量: {cookie_count}
                         spec_value = None
                         spec_name_2 = None
                         spec_value_2 = None
+
+                    if spec_parse_mode == 'one_spec' and spec_name and spec_value and not (spec_name_2 or spec_value_2):
+                        spec_name_2 = ''
+                        spec_value_2 = ''
+                        logger.info(
+                            f"【{self.cookie_id}】订单详情明确解析为单规格，允许清空历史残留的第二规格字段: "
+                            f"order_id={order_id}, item_id={item_id}, spec={spec_name}:{spec_value}"
+                        )
 
                     # 获取订单状态（从闲鱼页面解析）
                     raw_order_status = _normalize_optional_text(result.get('order_status'))

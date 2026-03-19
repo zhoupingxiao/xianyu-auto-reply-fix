@@ -68,6 +68,9 @@ def _should_use_cached_order(existing_order: Dict[str, Any], item_config: Dict[s
         if configured_amount is not None and amount_value is not None and abs(amount_value - configured_amount) <= 0.0009:
             return False
 
+    if item_config and item_config.get('is_multi_spec'):
+        return amount_valid and status_valid and has_valid_spec
+
     return amount_valid and (status_valid or has_valid_spec)
 
 
@@ -86,6 +89,7 @@ class OrderDetailFetcher:
         self._last_order_status_source = 'unknown'
         self._active_order_id = ''
         self._captured_amount_candidates: List[Dict[str, Any]] = []
+        self._captured_sku_candidates: List[Dict[str, Any]] = []
         self._pending_response_tasks = set()
         self._response_handler = None
 
@@ -457,6 +461,7 @@ class OrderDetailFetcher:
                         'quantity': sku_info.get('quantity', '') if sku_info else '',  # 数量
                         'amount': sku_info.get('amount', '') if sku_info else '',      # 金额
                         'amount_source': sku_info.get('amount_source', '') if sku_info else '',
+                        'spec_parse_mode': self._classify_spec_parse_mode(sku_info),
                         'order_status': order_status,  # 订单状态
                         'order_status_source': self._last_order_status_source,
                         'timestamp': time.time(),
@@ -604,6 +609,7 @@ class OrderDetailFetcher:
     def _reset_amount_capture(self, order_id: str) -> None:
         self._active_order_id = str(order_id or '').strip()
         self._captured_amount_candidates = []
+        self._captured_sku_candidates = []
         self._pending_response_tasks = set()
 
     def _clear_response_capture_handler(self) -> None:
@@ -713,6 +719,69 @@ class OrderDetailFetcher:
             return True
 
         return self._is_trusted_order_detail_response_url(lowered_url)
+
+    def _normalize_quantity_text(self, quantity_value: Any) -> Optional[str]:
+        text = str(quantity_value or '').strip()
+        if not text:
+            return None
+
+        match = re.search(r'(\d+)', text)
+        if not match:
+            return None
+
+        try:
+            normalized = str(int(match.group(1)))
+        except (TypeError, ValueError):
+            return None
+
+        if normalized == '0':
+            return None
+        return normalized
+
+    def _extract_sku_candidates_from_payload(self, payload: Any, path: str = 'root', depth: int = 0) -> List[Dict[str, Any]]:
+        if payload is None or depth > 8:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+
+        if isinstance(payload, dict):
+            quantity_context = None
+            for quantity_key in ('buyAmount', 'buy_amount', 'quantity', 'itemCount', 'count', 'num'):
+                if quantity_key in payload:
+                    quantity_context = self._normalize_quantity_text(payload.get(quantity_key))
+                    if quantity_context:
+                        break
+
+            for key, value in payload.items():
+                key_text = str(key)
+                normalized_key = key_text.lower()
+                key_path = f"{path}.{key_text}"
+
+                if normalized_key in {'skuinfo', 'sku_info', 'skutext', 'sku_text', 'skudesc', 'sku_desc'} and isinstance(value, str):
+                    sku_text = re.sub(r'\s+', ' ', value).strip()
+                    if sku_text and len(sku_text) <= 120 and (':' in sku_text or '：' in sku_text):
+                        score = 180
+                        if '.itemInfo.' in key_path:
+                            score += 80
+                        if quantity_context:
+                            score += 10
+                        if ';' in sku_text:
+                            score += 10
+
+                        candidates.append({
+                            'sku_text': sku_text,
+                            'quantity': quantity_context,
+                            'path': key_path,
+                            'score': score,
+                        })
+
+                candidates.extend(self._extract_sku_candidates_from_payload(value, path=key_path, depth=depth + 1))
+
+        elif isinstance(payload, list):
+            for index, item in enumerate(payload[:50]):
+                candidates.extend(self._extract_sku_candidates_from_payload(item, path=f"{path}[{index}]", depth=depth + 1))
+
+        return candidates
 
     def _score_amount_key_candidate(self, normalized_key: str, *, context: str = '', path: str = '') -> int:
         key = str(normalized_key or '').lower()
@@ -969,20 +1038,27 @@ class OrderDetailFetcher:
                 return
 
             response_candidates = self._extract_amount_candidates_from_payload(payload, path=f"response[{url.split('?')[0]}]")
-            if not response_candidates:
-                return
-
             for candidate in response_candidates:
                 candidate_copy = dict(candidate)
                 candidate_copy['source'] = f"structured_response::{candidate['source']}"
                 candidate_copy['response_url'] = url
                 self._captured_amount_candidates.append(candidate_copy)
 
-            best_candidate = max(response_candidates, key=lambda item: item.get('score', 0))
-            logger.info(
-                f"捕获订单金额候选: order_id={order_id}, amount={best_candidate.get('amount')}, "
-                f"score={best_candidate.get('score')}, source={best_candidate.get('source')}, url={url}"
-            )
+            if response_candidates:
+                best_candidate = max(response_candidates, key=lambda item: item.get('score', 0))
+                logger.info(
+                    f"捕获订单金额候选: order_id={order_id}, amount={best_candidate.get('amount')}, "
+                    f"score={best_candidate.get('score')}, source={best_candidate.get('source')}, url={url}"
+                )
+
+            sku_candidates = self._extract_sku_candidates_from_payload(payload, path=f"response[{url.split('?')[0]}]")
+            self._captured_sku_candidates.extend(sku_candidates)
+            if sku_candidates:
+                best_sku_candidate = max(sku_candidates, key=lambda item: item.get('score', 0))
+                logger.info(
+                    f"捕获订单规格候选: order_id={order_id}, sku={best_sku_candidate.get('sku_text')}, "
+                    f"quantity={best_sku_candidate.get('quantity') or ''}, path={best_sku_candidate.get('path')}"
+                )
         except Exception as e:
             logger.debug(f"解析订单详情响应失败: {e}")
 
@@ -1005,6 +1081,28 @@ class OrderDetailFetcher:
             deduped.values(),
             key=lambda item: (item.get('score', 0), item.get('amount', '')),
             reverse=True
+        )
+        return ranked_candidates[0] if ranked_candidates else None
+
+    def _get_best_captured_sku_candidate(self) -> Optional[Dict[str, Any]]:
+        if not self._captured_sku_candidates:
+            return None
+
+        deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for candidate in self._captured_sku_candidates:
+            dedupe_key = (
+                str(candidate.get('sku_text', '')),
+                str(candidate.get('quantity', '')),
+                str(candidate.get('path', '')),
+            )
+            existing = deduped.get(dedupe_key)
+            if existing is None or candidate.get('score', 0) > existing.get('score', 0):
+                deduped[dedupe_key] = candidate
+
+        ranked_candidates = sorted(
+            deduped.values(),
+            key=lambda item: (item.get('score', 0), len(str(item.get('sku_text', '')))),
+            reverse=True,
         )
         return ranked_candidates[0] if ranked_candidates else None
 
@@ -1065,6 +1163,34 @@ class OrderDetailFetcher:
             return normalized_amount, source
 
         return None, 'unknown'
+
+    async def _extract_sku_from_structured_content(self) -> Dict[str, str]:
+        await self._wait_for_response_capture_tasks(timeout=1.5)
+
+        best_candidate = self._get_best_captured_sku_candidate()
+        if not best_candidate:
+            return {}
+
+        sku_text = str(best_candidate.get('sku_text') or '').strip()
+        if not sku_text:
+            return {}
+
+        parsed = self._parse_sku_content(sku_text)
+        if not parsed:
+            return {}
+
+        sanitized = self._sanitize_sku_result(parsed, source='structured_response_candidate')
+        quantity = self._normalize_quantity_text(best_candidate.get('quantity'))
+        if quantity:
+            sanitized['quantity'] = quantity
+
+        if sanitized:
+            logger.info(
+                f"采用结构化响应规格候选: sku={sku_text}, quantity={quantity or ''}, "
+                f"path={best_candidate.get('path')}"
+            )
+
+        return sanitized
 
     async def _extract_amount_from_semantic_blocks(self) -> Tuple[Optional[str], str]:
         semantic_keywords = [
@@ -1334,7 +1460,48 @@ class OrderDetailFetcher:
         ]
         return any(re.match(pattern, normalized) for pattern in datetime_patterns)
 
-    def _is_valid_spec_candidate(self, spec_name: str, spec_value: str) -> bool:
+    def _is_text_fallback_spec_name_like(self, spec_name: str) -> bool:
+        """校验纯文本兜底中的规格名称是否像真实SKU字段。"""
+        normalized = re.sub(r'\s+', '', (spec_name or '').strip())
+        if not normalized:
+            return False
+
+        strict_patterns = [
+            r'^(?:商品)?类型\d*$',
+            r'^(?:商品)?规格\d*$',
+            r'^版本(?:选择)?\d*$',
+            r'^(?:商品)?分类$',
+            r'^选区$',
+            r'^区服$',
+            r'^服区$',
+            r'^分区$',
+            r'^平台$',
+            r'^系统$',
+            r'^颜色$',
+            r'^尺码$',
+            r'^尺寸$',
+            r'^套餐(?:类型)?$',
+            r'^型号(?:选择)?$',
+            r'^配置$',
+            r'^容量$',
+            r'^时长$',
+            r'^面额$',
+            r'^账号(?:类型)?$',
+            r'^远程$',
+            r'^语言$',
+            r'^发货方式$',
+            r'^安装方式$',
+            r'^接口$',
+            r'^选项\d*$',
+            r'^属性\d*$',
+            r'^服务器$',
+            r'^角色$',
+            r'^职业$',
+            r'^档位$',
+        ]
+        return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in strict_patterns)
+
+    def _is_valid_spec_candidate(self, spec_name: str, spec_value: str, *, strict: bool = False) -> bool:
         """校验规格候选是否可信，过滤备案信息/时间等误命中。"""
         name = (spec_name or '').strip()
         value = (spec_value or '').strip()
@@ -1372,6 +1539,9 @@ class OrderDetailFetcher:
         if any(token in lower_value for token in invalid_tokens):
             return False
 
+        if strict and not self._is_text_fallback_spec_name_like(name):
+            return False
+
         return True
 
     def _sanitize_sku_result(self, sku_info: Dict[str, str], source: str = "unknown") -> Dict[str, str]:
@@ -1386,8 +1556,9 @@ class OrderDetailFetcher:
         spec_name_2 = (result.get('spec_name_2') or '').strip()
         spec_value_2 = (result.get('spec_value_2') or '').strip()
 
-        primary_valid = self._is_valid_spec_candidate(spec_name, spec_value)
-        secondary_valid = self._is_valid_spec_candidate(spec_name_2, spec_value_2) if (spec_name_2 or spec_value_2) else False
+        strict_validation = source.startswith('text_fallback')
+        primary_valid = self._is_valid_spec_candidate(spec_name, spec_value, strict=strict_validation)
+        secondary_valid = self._is_valid_spec_candidate(spec_name_2, spec_value_2, strict=strict_validation) if (spec_name_2 or spec_value_2) else False
 
         if not primary_valid and (spec_name or spec_value):
             logger.warning(
@@ -1584,6 +1755,27 @@ class OrderDetailFetcher:
             except Exception:
                 return ''
 
+    def _build_spec_candidate_identity(self, candidate: Dict[str, str]) -> Tuple[str, str, str, str]:
+        """构建规格候选去重键，避免同一候选重复进入兜底流程。"""
+        return (
+            (candidate.get('spec_name') or '').strip(),
+            (candidate.get('spec_value') or '').strip(),
+            (candidate.get('spec_name_2') or '').strip(),
+            (candidate.get('spec_value_2') or '').strip(),
+        )
+
+    def _classify_spec_parse_mode(self, sku_info: Optional[Dict[str, str]]) -> str:
+        """根据当前SKU结果判断规格解析模式。"""
+        info = sku_info or {}
+        has_primary = bool((info.get('spec_name') or '').strip() and (info.get('spec_value') or '').strip())
+        has_secondary = bool((info.get('spec_name_2') or '').strip() and (info.get('spec_value_2') or '').strip())
+
+        if has_primary and has_secondary:
+            return 'two_spec'
+        if has_primary:
+            return 'one_spec'
+        return 'no_spec'
+
     def _extract_sku_from_text(self, text: str) -> Dict[str, str]:
         """从页面纯文本中兜底提取金额/规格/数量"""
         result: Dict[str, str] = {}
@@ -1622,6 +1814,7 @@ class OrderDetailFetcher:
 
         # 规格提取：过滤明显非规格行
         spec_candidates = []
+        spec_candidate_keys = set()
         ignore_tokens = [
             'http://', 'https://', 'fleamarket://', '订单', '买家', '卖家', '地址',
             '手机', '电话', '时间', '发货', '付款', '交易', '退款', '去发货', '修改价格',
@@ -1649,22 +1842,35 @@ class OrderDetailFetcher:
             if parsed:
                 sanitized_candidate = self._sanitize_sku_result(parsed, source="text_fallback_candidate")
                 if sanitized_candidate.get('spec_name') and sanitized_candidate.get('spec_value'):
-                    spec_candidates.append(sanitized_candidate)
+                    candidate_key = self._build_spec_candidate_identity(sanitized_candidate)
+                    if candidate_key not in spec_candidate_keys:
+                        spec_candidate_keys.add(candidate_key)
+                        spec_candidates.append(sanitized_candidate)
 
         if spec_candidates:
-            primary = spec_candidates[0]
-            if primary.get('spec_name') and primary.get('spec_value'):
-                result['spec_name'] = primary['spec_name']
-                result['spec_value'] = primary['spec_value']
-            if primary.get('spec_name_2') and primary.get('spec_value_2'):
-                result['spec_name_2'] = primary['spec_name_2']
-                result['spec_value_2'] = primary['spec_value_2']
+            explicit_multi_spec_candidates = [
+                candidate for candidate in spec_candidates
+                if candidate.get('spec_name_2') and candidate.get('spec_value_2')
+            ]
 
-            if len(spec_candidates) > 1 and 'spec_name_2' not in result:
-                second = spec_candidates[1]
-                if second.get('spec_name') and second.get('spec_value'):
-                    result['spec_name_2'] = second['spec_name']
-                    result['spec_value_2'] = second['spec_value']
+            selected_candidate = None
+            if len(explicit_multi_spec_candidates) == 1:
+                selected_candidate = explicit_multi_spec_candidates[0]
+            elif len(spec_candidates) == 1:
+                selected_candidate = spec_candidates[0]
+            else:
+                logger.warning(
+                    "SKU文本兜底检测到多个规格候选，判定为歧义并跳过规格字段: "
+                    f"{[self._build_spec_candidate_identity(candidate) for candidate in spec_candidates]}"
+                )
+
+            if selected_candidate:
+                if selected_candidate.get('spec_name') and selected_candidate.get('spec_value'):
+                    result['spec_name'] = selected_candidate['spec_name']
+                    result['spec_value'] = selected_candidate['spec_value']
+                if selected_candidate.get('spec_name_2') and selected_candidate.get('spec_value_2'):
+                    result['spec_name_2'] = selected_candidate['spec_name_2']
+                    result['spec_value_2'] = selected_candidate['spec_value_2']
 
         return self._sanitize_sku_result(result, source="text_fallback_result")
 
@@ -1864,6 +2070,12 @@ class OrderDetailFetcher:
                 result['amount'] = adjusted_coin_amount
                 result['amount_source'] = adjusted_coin_source
 
+            structured_sku_result = await self._extract_sku_from_structured_content()
+            if structured_sku_result:
+                for key in ['spec_name', 'spec_value', 'spec_name_2', 'spec_value_2', 'quantity']:
+                    if structured_sku_result.get(key):
+                        result[key] = structured_sku_result[key]
+
             # 收集所有元素的内容
             all_contents = []
             for i, element in enumerate(sku_elements):
@@ -1931,19 +2143,52 @@ class OrderDetailFetcher:
                 result['quantity'] = quantity_value
                 logger.info(f"提取到数量: {quantity_value}")
 
-            # 如果核心字段缺失，使用页面文本兜底
-            if (
-                'amount' not in result
-                or 'spec_name' not in result
-                or 'spec_value' not in result
-                or 'quantity' not in result
-            ):
-                for key in ['amount', 'amount_source', 'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2', 'quantity']:
-                    if key not in result and fallback_result.get(key):
-                        result[key] = fallback_result[key]
+            # 如果核心字段缺失，使用页面文本兜底；规格字段仅在主通道缺失主规格时才整体补齐
+            fallback_used = False
+            if 'amount' not in result and fallback_result.get('amount'):
+                result['amount'] = fallback_result['amount']
+                fallback_used = True
+            if 'amount_source' not in result and fallback_result.get('amount_source'):
+                result['amount_source'] = fallback_result['amount_source']
+                fallback_used = True
 
-                if fallback_result:
-                    logger.info(f"SKU文本兜底解析结果: {fallback_result}")
+            has_primary_spec = bool(result.get('spec_name') and result.get('spec_value'))
+            if not has_primary_spec and fallback_result.get('spec_name') and fallback_result.get('spec_value'):
+                result['spec_name'] = fallback_result['spec_name']
+                result['spec_value'] = fallback_result['spec_value']
+                fallback_used = True
+
+                if fallback_result.get('spec_name_2') and fallback_result.get('spec_value_2'):
+                    result['spec_name_2'] = fallback_result['spec_name_2']
+                    result['spec_value_2'] = fallback_result['spec_value_2']
+            elif has_primary_spec and fallback_result.get('spec_name_2') and fallback_result.get('spec_value_2'):
+                same_primary_spec = (
+                    (result.get('spec_name') or '').strip() == (fallback_result.get('spec_name') or '').strip()
+                    and (result.get('spec_value') or '').strip() == (fallback_result.get('spec_value') or '').strip()
+                )
+
+                if same_primary_spec:
+                    result['spec_name_2'] = fallback_result['spec_name_2']
+                    result['spec_value_2'] = fallback_result['spec_value_2']
+                    fallback_used = True
+                    logger.info(
+                        "主通道与文本兜底主规格一致，补齐第二规格: "
+                        f"{fallback_result.get('spec_name_2')}:{fallback_result.get('spec_value_2')}"
+                    )
+                else:
+                    logger.warning(
+                        "主通道已获取主规格，忽略文本兜底补入的不一致第二规格，避免单规格订单被误判为双规格: "
+                        f"primary={result.get('spec_name')}:{result.get('spec_value')}, "
+                        f"fallback={fallback_result.get('spec_name')}:{fallback_result.get('spec_value')}, "
+                        f"secondary={fallback_result.get('spec_name_2')}:{fallback_result.get('spec_value_2')}"
+                    )
+
+            if 'quantity' not in result and fallback_result.get('quantity'):
+                result['quantity'] = fallback_result['quantity']
+                fallback_used = True
+
+            if fallback_result and fallback_used:
+                logger.info(f"SKU文本兜底解析结果: {fallback_result}")
 
             # 确保数量字段存在，如果不存在则设置为1
             if 'quantity' not in result:
