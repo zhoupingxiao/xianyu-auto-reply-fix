@@ -95,6 +95,34 @@ SENSITIVE_FIELD_PATTERNS = [
     re.compile(r'([?&](?:api[_-]?key|secret|token|cookie|password|proxy_pass)=)([^&\s]+)', re.IGNORECASE),
 ]
 
+ORDER_STATUS_ALIASES = {
+    'success': 'completed',
+    'finished': 'completed',
+    'pending_delivery': 'pending_ship',
+    'delivered': 'shipped',
+    'closed': 'cancelled',
+    'refunded': 'cancelled',
+    'canceled': 'cancelled',
+    '处理中': 'processing',
+    '待付款': 'pending_payment',
+    '待发货': 'pending_ship',
+    '部分发货': 'partial_success',
+    '部分待收尾': 'partial_pending_finalize',
+    '已发货': 'shipped',
+    '已完成': 'completed',
+    '退款中': 'refunding',
+    '退款撤销': 'refund_cancelled',
+    '已关闭': 'cancelled',
+}
+
+SALES_ELIGIBLE_ORDER_STATUSES = {
+    'pending_ship',
+    'partial_success',
+    'partial_pending_finalize',
+    'shipped',
+    'completed',
+}
+
 
 def mask_sensitive_text(text: Any) -> str:
     raw_text = str(text or '')
@@ -135,6 +163,35 @@ def mask_secret_value(secret_value: str) -> str:
 
 def safe_client_error(message: str = '操作失败，请稍后重试') -> str:
     return message
+
+
+def normalize_order_status_value(status: Any) -> str:
+    normalized = str(status or '').strip().lower()
+    if not normalized:
+        return 'unknown'
+    return ORDER_STATUS_ALIASES.get(normalized, normalized)
+
+
+def is_sales_eligible_order_status(status: Any) -> bool:
+    return normalize_order_status_value(status) in SALES_ELIGIBLE_ORDER_STATUSES
+
+
+def parse_order_amount_value(raw_amount: Any) -> Optional[float]:
+    if raw_amount is None:
+        return None
+
+    amount_text = str(raw_amount).strip()
+    if not amount_text or amount_text.lower() in {'none', 'null', 'nan'}:
+        return None
+
+    normalized = re.sub(r'[^\d.-]', '', amount_text)
+    if normalized in {'', '-', '.', '-.'}:
+        return None
+
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return None
 
 
 def format_sse_event(event_name: str, data: Dict[str, Any]) -> str:
@@ -1291,7 +1348,7 @@ async def get_sales_data(
         
         # 构建查询
         placeholders = ','.join(['?'] * len(cookie_ids))
-        query = f"SELECT amount, created_at FROM orders WHERE cookie_id IN ({placeholders})"
+        query = f"SELECT amount, created_at, order_status FROM orders WHERE cookie_id IN ({placeholders})"
         params = list(cookie_ids)
         
         if start_date:
@@ -1314,30 +1371,38 @@ async def get_sales_data(
         sales_by_date = {}
         total_sales = 0.0
         valid_count = 0
-        
+        skipped_invalid_amount = 0
+        skipped_ineligible_status = 0
+
         for order in orders:
             amount_str = order[0]
             created_at = order[1]
-            
-            # 解析金额
-            try:
-                # 移除货币符号和逗号
-                amount_clean = amount_str.replace('￥', '').replace(',', '')
-                amount = float(amount_clean)
-                local_date = utc_timestamp_to_local_date_string(created_at)
-                if not local_date:
-                    continue
+            order_status = order[2]
 
-                total_sales += amount
-                valid_count += 1
-                
-                # 直接按日期分组
-                if local_date not in sales_by_date:
-                    sales_by_date[local_date] = 0
-                sales_by_date[local_date] += amount
-            except (ValueError, TypeError):
-                # 跳过无效金额
+            if not is_sales_eligible_order_status(order_status):
+                skipped_ineligible_status += 1
                 continue
+
+            amount = parse_order_amount_value(amount_str)
+            if amount is None:
+                skipped_invalid_amount += 1
+                continue
+
+            local_date = utc_timestamp_to_local_date_string(created_at)
+            if not local_date:
+                continue
+
+            total_sales += amount
+            valid_count += 1
+
+            if local_date not in sales_by_date:
+                sales_by_date[local_date] = 0
+            sales_by_date[local_date] += amount
+
+        logger.info(
+            f"销售额数据统计完成: valid_count={valid_count}, skipped_invalid_amount={skipped_invalid_amount}, "
+            f"skipped_ineligible_status={skipped_ineligible_status}"
+        )
         
         # 转换为列表格式
         formatted_data = [
@@ -1417,38 +1482,47 @@ async def get_sales_summary(
         # 单次查询获取所有数据，减少数据库访问
         placeholders = ','.join(['?'] * len(cookie_ids))
         month_start_utc = local_date_to_utc_start(month_start_str)
-        query = f"SELECT amount, created_at FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
+        query = f"SELECT amount, created_at, order_status FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
         all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
-        
+
         # 计算销售额
         today_sales = 0.0
         week_sales = 0.0
         month_sales = 0.0
-        
+        skipped_invalid_amount = 0
+        skipped_ineligible_status = 0
+
         for order in all_orders:
             amount_str = order[0]
             created_at = order[1]
-            
-            try:
-                amount_clean = amount_str.replace('￥', '').replace(',', '')
-                amount = float(amount_clean)
-                local_created_at = utc_timestamp_to_local_datetime(created_at)
-                if not local_created_at:
-                    continue
-                
-                # 检查是否在本月
-                if local_created_at >= month_start:
-                    month_sales += amount
-                
-                # 检查是否在本周
-                if local_created_at >= week_start:
-                    week_sales += amount
-                
-                # 检查是否在当日
-                if local_created_at >= today_start:
-                    today_sales += amount
-            except (ValueError, TypeError):
+            order_status = order[2]
+
+            if not is_sales_eligible_order_status(order_status):
+                skipped_ineligible_status += 1
                 continue
+
+            amount = parse_order_amount_value(amount_str)
+            if amount is None:
+                skipped_invalid_amount += 1
+                continue
+
+            local_created_at = utc_timestamp_to_local_datetime(created_at)
+            if not local_created_at:
+                continue
+
+            if local_created_at >= month_start:
+                month_sales += amount
+
+            if local_created_at >= week_start:
+                week_sales += amount
+
+            if local_created_at >= today_start:
+                today_sales += amount
+
+        logger.info(
+            f"销售额摘要统计完成: skipped_invalid_amount={skipped_invalid_amount}, "
+            f"skipped_ineligible_status={skipped_ineligible_status}"
+        )
         
         today_sales = round(today_sales, 2)
         week_sales = round(week_sales, 2)

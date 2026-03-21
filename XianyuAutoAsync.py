@@ -2840,8 +2840,10 @@ class XianyuLive:
         if not normalized_text:
             return None
 
+        direct_match_found = False
         direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
         if direct_match:
+            direct_match_found = True
             normalized_text = direct_match.group(1)
 
         colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
@@ -2849,9 +2851,10 @@ class XianyuLive:
         if long_numeric_parts:
             return long_numeric_parts[0]
 
-        generic_matches = re.findall(r'\d{16,}', normalized_text)
-        if generic_matches:
-            return generic_matches[0]
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
         return None
 
     def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
@@ -2876,7 +2879,6 @@ class XianyuLive:
         text_lower = normalized_text.lower()
         if (
             'updatekey' in source_lower
-            or 'extjson' in source_lower
             or 'updatekey' in text_lower
             or ('trade_' in text_lower and ':' in normalized_text)
             or ('buyer_confirm' in text_lower and ':' in normalized_text)
