@@ -1,7 +1,7 @@
 /* 关于页 - 支持作者卡片 */
 
 .about-donate-card {
-    max-width: 400px;
+    max-width: 760px;
     margin: 0 auto;
     text-align: center;
     background: var(--card-bg);
@@ -18,10 +18,26 @@
     margin: 0 0 1.25rem;
 }
 
+.about-donate-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2rem;
+    align-items: stretch;
+}
+
+.about-donate-item {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 360px;
+}
+
 .about-donate-img {
     width: 100%;
-    max-width: 320px;
-    height: auto;
+    max-width: 300px;
+    max-height: 360px;
+    object-fit: contain;
+    object-position: center;
     border-radius: 10px;
     display: block;
     margin: 0 auto;
@@ -31,4 +47,23 @@
     font-size: 0.82rem;
     color: var(--text-secondary);
     margin: 1rem 0 0;
+}
+
+@media (max-width: 768px) {
+    .about-donate-card {
+        max-width: 420px;
+    }
+
+    .about-donate-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .about-donate-item {
+        min-height: auto;
+    }
+
+    .about-donate-img {
+        max-width: 300px;
+        max-height: none;
+    }
 }
