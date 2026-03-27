@@ -95,6 +95,34 @@ SENSITIVE_FIELD_PATTERNS = [
     re.compile(r'([?&](?:api[_-]?key|secret|token|cookie|password|proxy_pass)=)([^&\s]+)', re.IGNORECASE),
 ]
 
+ORDER_STATUS_ALIASES = {
+    'success': 'completed',
+    'finished': 'completed',
+    'pending_delivery': 'pending_ship',
+    'delivered': 'shipped',
+    'closed': 'cancelled',
+    'refunded': 'cancelled',
+    'canceled': 'cancelled',
+    '处理中': 'processing',
+    '待付款': 'pending_payment',
+    '待发货': 'pending_ship',
+    '部分发货': 'partial_success',
+    '部分待收尾': 'partial_pending_finalize',
+    '已发货': 'shipped',
+    '已完成': 'completed',
+    '退款中': 'refunding',
+    '退款撤销': 'refund_cancelled',
+    '已关闭': 'cancelled',
+}
+
+SALES_ELIGIBLE_ORDER_STATUSES = {
+    'pending_ship',
+    'partial_success',
+    'partial_pending_finalize',
+    'shipped',
+    'completed',
+}
+
 
 def mask_sensitive_text(text: Any) -> str:
     raw_text = str(text or '')
@@ -135,6 +163,35 @@ def mask_secret_value(secret_value: str) -> str:
 
 def safe_client_error(message: str = '操作失败，请稍后重试') -> str:
     return message
+
+
+def normalize_order_status_value(status: Any) -> str:
+    normalized = str(status or '').strip().lower()
+    if not normalized:
+        return 'unknown'
+    return ORDER_STATUS_ALIASES.get(normalized, normalized)
+
+
+def is_sales_eligible_order_status(status: Any) -> bool:
+    return normalize_order_status_value(status) in SALES_ELIGIBLE_ORDER_STATUSES
+
+
+def parse_order_amount_value(raw_amount: Any) -> Optional[float]:
+    if raw_amount is None:
+        return None
+
+    amount_text = str(raw_amount).strip()
+    if not amount_text or amount_text.lower() in {'none', 'null', 'nan'}:
+        return None
+
+    normalized = re.sub(r'[^\d.-]', '', amount_text)
+    if normalized in {'', '-', '.', '-.'}:
+        return None
+
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return None
 
 
 def format_sse_event(event_name: str, data: Dict[str, Any]) -> str:
@@ -723,6 +780,15 @@ setup_file_logging()
 from loguru import logger
 logger.info("Web服务器启动，文件日志收集器已初始化")
 
+
+# 启动定时任务调度器
+@app.on_event("startup")
+async def start_scheduled_task_checker():
+    """应用启动时开启定时任务检查协程"""
+    asyncio.create_task(scheduled_task_checker())
+    logger.info("定时任务调度器已启动")
+
+
 # 添加请求日志中间件
 @app.middleware("http")
 async def log_requests(request, call_next):
@@ -1282,7 +1348,7 @@ async def get_sales_data(
         
         # 构建查询
         placeholders = ','.join(['?'] * len(cookie_ids))
-        query = f"SELECT amount, created_at FROM orders WHERE cookie_id IN ({placeholders})"
+        query = f"SELECT amount, created_at, order_status FROM orders WHERE cookie_id IN ({placeholders})"
         params = list(cookie_ids)
         
         if start_date:
@@ -1305,30 +1371,38 @@ async def get_sales_data(
         sales_by_date = {}
         total_sales = 0.0
         valid_count = 0
-        
+        skipped_invalid_amount = 0
+        skipped_ineligible_status = 0
+
         for order in orders:
             amount_str = order[0]
             created_at = order[1]
-            
-            # 解析金额
-            try:
-                # 移除货币符号和逗号
-                amount_clean = amount_str.replace('￥', '').replace(',', '')
-                amount = float(amount_clean)
-                local_date = utc_timestamp_to_local_date_string(created_at)
-                if not local_date:
-                    continue
+            order_status = order[2]
 
-                total_sales += amount
-                valid_count += 1
-                
-                # 直接按日期分组
-                if local_date not in sales_by_date:
-                    sales_by_date[local_date] = 0
-                sales_by_date[local_date] += amount
-            except (ValueError, TypeError):
-                # 跳过无效金额
+            if not is_sales_eligible_order_status(order_status):
+                skipped_ineligible_status += 1
                 continue
+
+            amount = parse_order_amount_value(amount_str)
+            if amount is None:
+                skipped_invalid_amount += 1
+                continue
+
+            local_date = utc_timestamp_to_local_date_string(created_at)
+            if not local_date:
+                continue
+
+            total_sales += amount
+            valid_count += 1
+
+            if local_date not in sales_by_date:
+                sales_by_date[local_date] = 0
+            sales_by_date[local_date] += amount
+
+        logger.info(
+            f"销售额数据统计完成: valid_count={valid_count}, skipped_invalid_amount={skipped_invalid_amount}, "
+            f"skipped_ineligible_status={skipped_ineligible_status}"
+        )
         
         # 转换为列表格式
         formatted_data = [
@@ -1408,38 +1482,47 @@ async def get_sales_summary(
         # 单次查询获取所有数据，减少数据库访问
         placeholders = ','.join(['?'] * len(cookie_ids))
         month_start_utc = local_date_to_utc_start(month_start_str)
-        query = f"SELECT amount, created_at FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
+        query = f"SELECT amount, created_at, order_status FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
         all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
-        
+
         # 计算销售额
         today_sales = 0.0
         week_sales = 0.0
         month_sales = 0.0
-        
+        skipped_invalid_amount = 0
+        skipped_ineligible_status = 0
+
         for order in all_orders:
             amount_str = order[0]
             created_at = order[1]
-            
-            try:
-                amount_clean = amount_str.replace('￥', '').replace(',', '')
-                amount = float(amount_clean)
-                local_created_at = utc_timestamp_to_local_datetime(created_at)
-                if not local_created_at:
-                    continue
-                
-                # 检查是否在本月
-                if local_created_at >= month_start:
-                    month_sales += amount
-                
-                # 检查是否在本周
-                if local_created_at >= week_start:
-                    week_sales += amount
-                
-                # 检查是否在当日
-                if local_created_at >= today_start:
-                    today_sales += amount
-            except (ValueError, TypeError):
+            order_status = order[2]
+
+            if not is_sales_eligible_order_status(order_status):
+                skipped_ineligible_status += 1
                 continue
+
+            amount = parse_order_amount_value(amount_str)
+            if amount is None:
+                skipped_invalid_amount += 1
+                continue
+
+            local_created_at = utc_timestamp_to_local_datetime(created_at)
+            if not local_created_at:
+                continue
+
+            if local_created_at >= month_start:
+                month_sales += amount
+
+            if local_created_at >= week_start:
+                week_sales += amount
+
+            if local_created_at >= today_start:
+                today_sales += amount
+
+        logger.info(
+            f"销售额摘要统计完成: skipped_invalid_amount={skipped_invalid_amount}, "
+            f"skipped_ineligible_status={skipped_ineligible_status}"
+        )
         
         today_sales = round(today_sales, 2)
         week_sales = round(week_sales, 2)
@@ -3205,6 +3288,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
         # 检查是否已存在相同unb的账号
         existing_cookies = db_manager.get_all_cookies(user_id)
         existing_account_id = None
+        previous_cookie_value = None
 
         for account_id, cookie_value in existing_cookies.items():
             try:
@@ -3212,6 +3296,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                 existing_cookie_dict = trans_cookies(cookie_value)
                 if existing_cookie_dict.get('unb') == unb:
                     existing_account_id = account_id
+                    previous_cookie_value = cookie_value
                     break
             except:
                 continue
@@ -3277,20 +3362,78 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
-                    # 第二步：将真实cookie添加到cookie_manager（如果是新账号）或更新现有账号
-                    if cookie_manager.manager:
-                        if is_new_account:
-                            cookie_manager.manager.add_cookie(account_id, real_cookies)
-                            log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
+                    token_prewarmed = False
+                    task_restarted = False
+                    warning_message = None
+                    final_cookies = temp_instance.cookies_str or real_cookies
+
+                    try:
+                        log_with_user('info', f"开始预热扫码登录Token: {account_id}", current_user)
+                        prewarmed_token = await temp_instance.refresh_token()
+                        final_cookies = temp_instance.cookies_str or real_cookies
+
+                        if prewarmed_token:
+                            XianyuLive.cache_qr_prewarmed_token(account_id, prewarmed_token)
+                            token_prewarmed = True
+                            log_with_user('info', f"扫码登录Token预热成功: {account_id}", current_user)
                         else:
-                            # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                            cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
-                            log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                            warning_message = "真实Cookie已获取，但首次Token初始化失败，未切换到新的账号任务"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                    except Exception as token_e:
+                        final_cookies = temp_instance.cookies_str or real_cookies
+                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，未切换到新的账号任务: {str(token_e)}"
+                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+
+                    if token_prewarmed:
+                        try:
+                            if cookie_manager.manager:
+                                if is_new_account:
+                                    cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
+                                    log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
+                                else:
+                                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
+                                    cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
+                                    log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                                task_restarted = True
+                            else:
+                                warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                                log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        except Exception as task_switch_e:
+                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                            warning_message = f"真实Cookie和Token已获取，但切换账号任务失败: {str(task_switch_e)}"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+
+                    if not task_restarted:
+                        if token_prewarmed:
+                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                        if not warning_message:
+                            warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        if is_new_account:
+                            db_manager.delete_cookie(account_id)
+                            log_with_user('warning', f"扫码登录未完成切换，已删除临时创建的新账号记录: {account_id}", current_user)
+                        elif previous_cookie_value:
+                            db_manager.update_cookie_account_info(account_id, cookie_value=previous_cookie_value)
+                            log_with_user('warning', f"扫码登录未完成切换，已回滚现有账号Cookie: {account_id}", current_user)
+                        else:
+                            log_with_user('warning', f"扫码登录未完成切换，但未找到可回滚的旧Cookie: {account_id}", current_user)
 
                     # 更新风控日志状态
                     if risk_log_id:
                         try:
-                            db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='success', processing_result='扫码登录真实Cookie获取成功')
+                            if token_prewarmed and task_restarted:
+                                db_manager.update_risk_control_log(
+                                    log_id=risk_log_id,
+                                    processing_status='success',
+                                    processing_result='扫码登录真实Cookie获取成功，Token预热完成并已启动账号任务'
+                                )
+                            else:
+                                db_manager.update_risk_control_log(
+                                    log_id=risk_log_id,
+                                    processing_status='failed',
+                                    error_message=(warning_message or 'Token预热失败，未启动账号任务')[:200],
+                                    processing_result='扫码登录真实Cookie获取成功，但未切换到新任务'
+                                )
                         except Exception:
                             pass
 
@@ -3298,7 +3441,10 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         'account_id': account_id,
                         'is_new_account': is_new_account,
                         'real_cookie_refreshed': True,
-                        'cookie_length': len(real_cookies)
+                        'cookie_length': len(final_cookies),
+                        'token_prewarmed': token_prewarmed,
+                        'task_restarted': task_restarted,
+                        'warning_message': warning_message
                     }
                 else:
                     log_with_user('error', f"无法从数据库获取真实cookie: {account_id}", current_user)
@@ -5833,13 +5979,41 @@ def get_recent_delivery_logs(limit: int = 20, current_user: Dict[str, Any] = Dep
             cleaned_reason = reason_text[:bracket_start].rstrip()
             return cleaned_reason or reason_text, context
 
+        def is_redundant_skip_log(log: Dict[str, Any], successful_orders: set):
+            if str(log.get('status') or '').lower() != 'skipped':
+                return False
+
+            reason_text = str(log.get('reason') or '').strip()
+            order_id = str(log.get('order_id') or '').strip()
+            if not order_id or order_id not in successful_orders:
+                return False
+
+            redundant_reasons = {
+                '获取锁后发现订单已处理，跳过发货',
+                '订单延迟锁持有中，跳过发货',
+                '订单在冷却期内，跳过发货',
+            }
+            return reason_text in redundant_reasons
+
         user_id = current_user['user_id']
         safe_limit = max(1, min(int(limit), 200))
-        logs = db_manager.get_recent_delivery_logs(user_id=user_id, limit=safe_limit)
-        for log in logs:
+        raw_logs = db_manager.get_recent_delivery_logs(user_id=user_id, limit=min(safe_limit * 3, 600))
+        successful_orders = {
+            str(log.get('order_id') or '').strip()
+            for log in raw_logs
+            if str(log.get('status') or '').lower() == 'success' and str(log.get('order_id') or '').strip()
+        }
+
+        logs = []
+        for log in raw_logs:
             cleaned_reason, context = extract_spec_mode_context(log.get('reason'))
             log['reason'] = cleaned_reason
             log.update(context)
+            if is_redundant_skip_log(log, successful_orders):
+                continue
+            logs.append(log)
+            if len(logs) >= safe_limit:
+                break
         return {"logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -8737,6 +8911,298 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
             "success": False,
             "message": f"重启应用失败: {str(e)}"
         }
+
+
+# ==================== 一键擦亮API ====================
+
+@app.post("/accounts/{cid}/polish-items")
+async def polish_account_items(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """擦亮指定账号的所有在售商品"""
+    try:
+        cookie_info = db_manager.get_cookie_by_id(cid)
+        if not cookie_info:
+            return {"success": False, "message": "未找到指定的账号信息"}
+
+        cookies_str = cookie_info.get('cookies_str', '')
+        if not cookies_str:
+            return {"success": False, "message": "账号cookie信息为空"}
+
+        from XianyuAutoAsync import XianyuLive
+        xianyu_instance = XianyuLive(cookies_str, cid)
+
+        logger.info(f"开始擦亮账号 {cid} 的所有商品")
+        result = await xianyu_instance.polish_all_items()
+
+        await xianyu_instance.close_session()
+
+        return result
+
+    except Exception as e:
+        logger.error(f"擦亮账号商品异常: {str(e)}")
+        return {"success": False, "message": f"擦亮异常: {str(e)}"}
+
+
+# ==================== 定时任务管理API ====================
+
+def _parse_enabled_flag(value):
+    """将不同类型的 enabled 入参统一转换为 0/1"""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if int(value) else 0
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in {'1', 'true', 'yes', 'on'} else 0
+    return 1 if value else 0
+
+
+def _parse_run_hour(value, default=8):
+    run_hour = default if value is None else int(value)
+    if run_hour < 0 or run_hour > 23:
+        raise ValueError("运行时间必须在 0-23 之间")
+    return run_hour
+
+
+def _parse_random_delay(value, default=10):
+    random_delay_max = default if value is None else int(value)
+    if random_delay_max < 0:
+        raise ValueError("随机分钟不能小于 0")
+    return random_delay_max
+
+@app.post("/scheduled-tasks")
+async def create_scheduled_task(request: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """创建定时任务"""
+    try:
+        account_id = request.get('account_id', '').strip()
+        run_hour = _parse_run_hour(request.get('run_hour', request.get('delay_minutes', 8)))
+        random_delay_max = _parse_random_delay(request.get('random_delay_max', 10), 10)
+        enabled = _parse_enabled_flag(request.get('enabled', True))
+
+        if not account_id:
+            return {"success": False, "message": "账号ID不能为空"}
+
+        name = f"每日擦亮-{account_id}"
+        next_run_at = db_manager.calculate_next_daily_run(run_hour, random_delay_max, include_today=True)
+
+        existing_task = db_manager.get_scheduled_task_by_account(
+            account_id,
+            user_id=current_user['user_id'],
+            task_type='item_polish'
+        )
+
+        if existing_task:
+            updated = db_manager.update_scheduled_task(
+                existing_task['id'],
+                name=name,
+                interval_hours=24,
+                delay_minutes=run_hour,
+                random_delay_max=random_delay_max,
+                enabled=enabled,
+                next_run_at=next_run_at
+            )
+            if updated:
+                task = db_manager.get_scheduled_task(existing_task['id'])
+                return {
+                    "success": True,
+                    "message": "定时擦亮任务更新成功",
+                    "task_id": existing_task['id'],
+                    "task": task
+                }
+            return {"success": False, "message": "更新定时任务失败"}
+
+        task_id = db_manager.create_scheduled_task(
+            name=name, task_type='item_polish', account_id=account_id,
+            user_id=current_user['user_id'],
+            interval_hours=24, delay_minutes=run_hour,
+            random_delay_max=random_delay_max,
+            next_run_at=next_run_at,
+            enabled=enabled
+        )
+
+        if task_id:
+            task = db_manager.get_scheduled_task(task_id)
+            return {"success": True, "message": "定时擦亮任务创建成功", "task_id": task_id, "task": task}
+        else:
+            return {"success": False, "message": "创建定时任务失败"}
+    except Exception as e:
+        logger.error(f"创建定时任务异常: {str(e)}")
+        return {"success": False, "message": f"创建定时任务异常: {str(e)}"}
+
+
+@app.get("/scheduled-tasks")
+async def list_scheduled_tasks(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取定时任务列表"""
+    try:
+        tasks = db_manager.get_scheduled_tasks(user_id=current_user['user_id'])
+        return {"success": True, "tasks": tasks}
+    except Exception as e:
+        logger.error(f"获取定时任务列表异常: {str(e)}")
+        return {"success": False, "message": f"获取定时任务列表异常: {str(e)}"}
+
+
+@app.put("/scheduled-tasks/{task_id}")
+async def update_scheduled_task(task_id: int, request: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新定时任务"""
+    try:
+        task = db_manager.get_scheduled_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+        if task['user_id'] != current_user['user_id']:
+            return {"success": False, "message": "无权修改此任务"}
+
+        kwargs = {}
+
+        if 'name' in request:
+            name = str(request.get('name') or '').strip()
+            if name:
+                kwargs['name'] = name
+
+        if 'interval_hours' in request:
+            kwargs['interval_hours'] = int(request.get('interval_hours', task.get('interval_hours', 24)))
+
+        if 'run_hour' in request or 'delay_minutes' in request:
+            kwargs['delay_minutes'] = _parse_run_hour(request.get('run_hour', request.get('delay_minutes')))
+
+        if 'random_delay_max' in request:
+            kwargs['random_delay_max'] = _parse_random_delay(
+                request.get('random_delay_max'),
+                task.get('random_delay_max', 10)
+            )
+
+        if 'enabled' in request:
+            kwargs['enabled'] = _parse_enabled_flag(request.get('enabled'))
+
+        effective_enabled = kwargs.get('enabled', 1 if task['enabled'] else 0)
+        effective_run_hour = kwargs.get('delay_minutes', task.get('delay_minutes', 8))
+        effective_random_delay = kwargs.get('random_delay_max', task.get('random_delay_max', 10))
+
+        if task['task_type'] == 'item_polish' and effective_enabled:
+            should_reschedule = (
+                'delay_minutes' in kwargs or
+                'random_delay_max' in kwargs or
+                ('enabled' in kwargs and not task['enabled'])
+            )
+            if should_reschedule:
+                kwargs['next_run_at'] = db_manager.calculate_next_daily_run(
+                    effective_run_hour,
+                    effective_random_delay,
+                    include_today=True
+                )
+
+        if not kwargs:
+            return {"success": False, "message": "没有可更新的字段"}
+
+        if db_manager.update_scheduled_task(task_id, **kwargs):
+            updated_task = db_manager.get_scheduled_task(task_id)
+            return {"success": True, "message": "定时任务更新成功", "task": updated_task}
+        else:
+            return {"success": False, "message": "更新失败"}
+    except Exception as e:
+        logger.error(f"更新定时任务异常: {str(e)}")
+        return {"success": False, "message": f"更新定时任务异常: {str(e)}"}
+
+
+@app.delete("/scheduled-tasks/{task_id}")
+async def delete_scheduled_task(task_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除定时任务"""
+    try:
+        task = db_manager.get_scheduled_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+        if task['user_id'] != current_user['user_id']:
+            return {"success": False, "message": "无权删除此任务"}
+
+        if db_manager.delete_scheduled_task(task_id):
+            return {"success": True, "message": "定时任务已删除"}
+        else:
+            return {"success": False, "message": "删除失败"}
+    except Exception as e:
+        logger.error(f"删除定时任务异常: {str(e)}")
+        return {"success": False, "message": f"删除定时任务异常: {str(e)}"}
+
+
+@app.put("/scheduled-tasks/{task_id}/toggle")
+async def toggle_scheduled_task(task_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """启用/禁用定时任务"""
+    try:
+        task = db_manager.get_scheduled_task(task_id)
+        if not task:
+            return {"success": False, "message": "任务不存在"}
+        if task['user_id'] != current_user['user_id']:
+            return {"success": False, "message": "无权操作此任务"}
+
+        new_enabled = 0 if task['enabled'] else 1
+        update_kwargs = {'enabled': new_enabled}
+        if new_enabled:
+            update_kwargs['next_run_at'] = db_manager.calculate_next_daily_run(
+                task.get('delay_minutes', 8),
+                task.get('random_delay_max', 10),
+                include_today=True
+            )
+
+        if db_manager.update_scheduled_task(task_id, **update_kwargs):
+            status = "启用" if new_enabled else "禁用"
+            updated_task = db_manager.get_scheduled_task(task_id)
+            return {
+                "success": True,
+                "message": f"定时任务已{status}",
+                "enabled": bool(new_enabled),
+                "task": updated_task
+            }
+        else:
+            return {"success": False, "message": "操作失败"}
+    except Exception as e:
+        logger.error(f"切换定时任务状态异常: {str(e)}")
+        return {"success": False, "message": f"操作异常: {str(e)}"}
+
+
+# ==================== 定时任务调度器 ====================
+
+async def scheduled_task_checker():
+    """每60秒检查并执行到期的定时任务"""
+    while True:
+        try:
+            due_tasks = db_manager.get_due_tasks()
+            for task in due_tasks:
+                try:
+                    account_id = task['account_id']
+                    task_id = task['id']
+                    task_type = task['task_type']
+
+                    logger.info(f"执行定时任务: {task['name']} (ID: {task_id}, 账号: {account_id})")
+
+                    if task_type == 'item_polish':
+                        cookie_info = db_manager.get_cookie_by_id(account_id)
+                        if not cookie_info:
+                            logger.warning(f"定时任务 {task_id} 账号 {account_id} 不存在，跳过")
+                            result = {"success": False, "message": "账号不存在"}
+                        else:
+                            cookies_str = cookie_info.get('cookies_str', '')
+                            if not cookies_str:
+                                result = {"success": False, "message": "账号cookie为空"}
+                            else:
+                                from XianyuAutoAsync import XianyuLive
+                                xianyu_instance = XianyuLive(cookies_str, account_id)
+                                result = await xianyu_instance.polish_all_items()
+                                await xianyu_instance.close_session()
+                    else:
+                        result = {"success": False, "message": f"未知任务类型: {task_type}"}
+
+                    run_hour = task.get('delay_minutes', 8)  # delay_minutes 复用为每日运行小时
+                    random_max = task.get('random_delay_max', 10)
+                    next_run_str = db_manager.calculate_next_daily_run(
+                        run_hour,
+                        random_max,
+                        include_today=False
+                    )
+
+                    db_manager.update_task_run_result(task_id, result, next_run_str)
+                    logger.info(f"定时任务 {task_id} 执行完毕，下次运行: {next_run_str}")
+
+                except Exception as e:
+                    logger.error(f"执行定时任务 {task.get('id')} 异常: {str(e)}")
+        except Exception as e:
+            logger.error(f"定时任务检查异常: {str(e)}")
+        await asyncio.sleep(60)
 
 
 # 移除自动启动，由Start.py或手动启动

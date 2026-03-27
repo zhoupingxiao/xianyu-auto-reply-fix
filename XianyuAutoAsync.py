@@ -223,6 +223,53 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
+
+    # 扫码登录token预热缓存，避免扫码成功后正式任务立即再次刷新token
+    _qr_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float}}
+    _qr_prewarmed_token_ttl = 180  # 秒
+
+    @classmethod
+    def _cleanup_qr_prewarmed_tokens(cls):
+        """清理过期的扫码预热token缓存"""
+        now = time.time()
+        expired_cookie_ids = [
+            cookie_id
+            for cookie_id, token_info in cls._qr_prewarmed_tokens.items()
+            if now - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl
+        ]
+        for cookie_id in expired_cookie_ids:
+            cls._qr_prewarmed_tokens.pop(cookie_id, None)
+
+    @classmethod
+    def cache_qr_prewarmed_token(cls, cookie_id: str, token: str):
+        """缓存扫码登录预热好的token，供后续正式实例直接复用"""
+        if not cookie_id or not token:
+            return
+        cls._cleanup_qr_prewarmed_tokens()
+        cls._qr_prewarmed_tokens[cookie_id] = {
+            'token': token,
+            'timestamp': time.time()
+        }
+
+    @classmethod
+    def pop_qr_prewarmed_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
+        """弹出扫码登录预热token，过期则忽略"""
+        if not cookie_id:
+            return None
+        cls._cleanup_qr_prewarmed_tokens()
+        token_info = cls._qr_prewarmed_tokens.pop(cookie_id, None)
+        if not token_info:
+            return None
+        if time.time() - token_info.get('timestamp', 0) > cls._qr_prewarmed_token_ttl:
+            return None
+        return token_info
+
+    @classmethod
+    def clear_qr_prewarmed_token(cls, cookie_id: str):
+        """清理指定账号的扫码预热token缓存"""
+        if not cookie_id:
+            return
+        cls._qr_prewarmed_tokens.pop(cookie_id, None)
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -262,6 +309,18 @@ class XianyuLive:
         if len(segments) > 6:
             preview += f"; ...(+{len(segments) - 6} fields)"
         return preview
+
+    @staticmethod
+    def _extract_cookie_value(cookie_info: Optional[Dict[str, Any]]) -> str:
+        """兼容不同调用方返回字段名，提取cookie字符串"""
+        if not cookie_info:
+            return ''
+        return (
+            cookie_info.get('value')
+            or cookie_info.get('cookies_str')
+            or cookie_info.get('cookie_value')
+            or ''
+        )
 
     def _load_proxy_config(self) -> dict:
         """从数据库加载当前账号的代理配置"""
@@ -780,6 +839,12 @@ class XianyuLive:
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
 
+        prewarmed_token_info = self.pop_qr_prewarmed_token(self.cookie_id)
+        if prewarmed_token_info:
+            self.current_token = prewarmed_token_info.get('token')
+            self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
+            logger.info(f"【{cookie_id}】已复用扫码预热token，跳过首次token刷新")
+
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
         self.notification_cooldown = 300  # 5分钟内不重复发送相同类型的通知
@@ -890,6 +955,8 @@ class XianyuLive:
 
         # 订单详情补抓任务：详情首次超时时，后台再补抓一次，避免整单丢失
         self.order_detail_retry_tasks = {}
+        self.order_detail_force_refresh_marks = {}
+        self.order_detail_force_refresh_cooldown = 5
 
         # 初始化订单状态处理器
         self._init_order_status_handler()
@@ -1111,8 +1178,18 @@ class XianyuLive:
             return {"match_type": "missing", "order": None}
 
         order = recent_orders[0]
+        order_id = str(order.get("order_id") or "").strip()
         order_status = str(order.get("order_status") or "").strip()
-        if order_status in {"shipped", "completed"}:
+        if order_status == "shipped":
+            if self._has_delivery_progress_evidence(order_id):
+                match_type = "already_processed"
+            else:
+                match_type = "suspicious_shipped"
+                logger.warning(
+                    f"{log_prefix} sid兜底命中可疑已发货订单，检测到无真实发货进度，继续允许纠偏: "
+                    f"sid={normalized_sid}, order_id={order_id}, status={order_status}"
+                )
+        elif order_status == "completed":
             match_type = "already_processed"
         elif order_status == "cancelled":
             match_type = "cancelled"
@@ -1126,6 +1203,78 @@ class XianyuLive:
             f"order_id={order.get('order_id')}, status={order_status or 'unknown'}, match_type={match_type}"
         )
         return {"match_type": match_type, "order": order}
+
+    async def _refresh_sid_lookup_if_needed(self, sid: str, sid_lookup: Dict[str, Any], *,
+                                            item_id: str = None, buyer_id: str = None,
+                                            minutes: int = 10, allow_bargain_ready: bool = False,
+                                            log_prefix: str = "") -> Dict[str, Any]:
+        """sid 命中未就绪订单时，强刷详情后再判定一次。"""
+        recent_order = (sid_lookup or {}).get('order')
+        match_type = (sid_lookup or {}).get('match_type', 'missing')
+
+        if not recent_order or match_type not in {'not_ready', 'other_status', 'suspicious_shipped'}:
+            return sid_lookup
+
+        order_id = str(recent_order.get('order_id') or '').strip()
+        if not order_id:
+            return sid_lookup
+
+        refresh_item_id = recent_order.get('item_id') or item_id
+        refresh_buyer_id = recent_order.get('buyer_id') or buyer_id
+        old_status = recent_order.get('order_status') or 'unknown'
+
+        logger.info(
+            f"{log_prefix} sid命中的订单状态未就绪，尝试强制刷新订单详情后重试: "
+            f"order_id={order_id}, status={old_status}"
+        )
+
+        if not self._reserve_order_detail_force_refresh(
+            order_id,
+            reason='sid_not_ready',
+            log_prefix=log_prefix,
+        ):
+            return sid_lookup
+
+        try:
+            await self.fetch_order_detail_info(
+                order_id,
+                refresh_item_id,
+                refresh_buyer_id,
+                sid=sid,
+                force_refresh=True
+            )
+        except Exception as refresh_error:
+            logger.warning(f"{log_prefix} sid未就绪订单强刷失败: {self._safe_str(refresh_error)}")
+            return sid_lookup
+
+        refreshed_lookup = self._lookup_delivery_order_by_sid(
+            sid,
+            minutes=minutes,
+            log_prefix=log_prefix
+        )
+        refreshed_order = refreshed_lookup.get('order') or {}
+
+        if (
+            allow_bargain_ready and
+            refreshed_lookup.get('match_type') == 'not_ready' and
+            refreshed_order and
+            str(refreshed_order.get('order_status') or '').strip() in {'processing', 'pending_payment'} and
+            self._has_bargain_success_evidence(refreshed_order)
+        ):
+            refreshed_lookup = dict(refreshed_lookup)
+            refreshed_lookup['match_type'] = 'bargain_ready'
+            logger.info(
+                f"{log_prefix} sid强刷后仍未进入待发货，但检测到小刀成功证据，"
+                f"改用小刀兜底发货: order_id={refreshed_order.get('order_id') or order_id}, "
+                f"status={refreshed_order.get('order_status') or 'unknown'}"
+            )
+
+        logger.info(
+            f"{log_prefix} sid强刷后重新判定: order_id={refreshed_order.get('order_id') or order_id}, "
+            f"status={refreshed_order.get('order_status') or 'unknown'}, "
+            f"match_type={refreshed_lookup.get('match_type', 'missing')}"
+        )
+        return refreshed_lookup
 
     async def _ensure_item_owned_by_current_account(self, item_id: str, *,
                                                     log_prefix: str = "",
@@ -1672,63 +1821,9 @@ class XianyuLive:
     def _extract_order_id_for_comment(self, message: dict) -> str:
         """从评价提醒消息中提取订单ID"""
         try:
-            order_id = None
-            
-            # 方法1: 从button的targetUrl中提取orderId
-            if isinstance(message, dict) and "1" in message and isinstance(message["1"], dict):
-                message_1 = message["1"]
-                if "6" in message_1 and isinstance(message_1["6"], dict):
-                    message_6 = message_1["6"]
-                    if "3" in message_6 and isinstance(message_6["3"], dict):
-                        message_6_3 = message_6["3"]
-                        if "5" in message_6_3:
-                            try:
-                                content_str = message_6_3["5"]
-                                content_data = json.loads(content_str)
-                                # 从button的targetUrl中提取orderId
-                                target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
-                                if target_url and 'orderId=' in target_url:
-                                    order_match = re.search(r'orderId=(\d+)', target_url)
-                                    if order_match:
-                                        order_id = order_match.group(1)
-                                        logger.info(f'【{self.cookie_id}】从button targetUrl提取到订单ID: {order_id}')
-                            except (json.JSONDecodeError, KeyError) as e:
-                                logger.warning(f"【{self.cookie_id}】解析评价消息JSON失败: {e}")
-            
-            # 方法2: 从extJson中提取orderId
-            if not order_id:
-                if isinstance(message, dict) and "1" in message and isinstance(message["1"], dict):
-                    message_1 = message["1"]
-                    if "10" in message_1 and isinstance(message_1["10"], dict):
-                        ext_json_str = message_1["10"].get("extJson", "")
-                        if ext_json_str:
-                            try:
-                                ext_json = json.loads(ext_json_str)
-                                # 从updateKey中提取orderId
-                                update_key = ext_json.get("updateKey", "")
-                                if update_key:
-                                    # updateKey格式: "3114528891587728869:20:BUYER_CONFIRM_RATE_SELLER:74"
-                                    parts = update_key.split(":")
-                                    if len(parts) > 0 and parts[0].isdigit():
-                                        order_id = parts[0]
-                                        logger.info(f'【{self.cookie_id}】从updateKey提取到订单ID: {order_id}')
-                            except (json.JSONDecodeError, KeyError) as e:
-                                logger.warning(f"【{self.cookie_id}】解析extJson失败: {e}")
-            
-            # 方法3: 正则搜索整个消息
-            if not order_id:
-                message_str = str(message)
-                patterns = [
-                    r'orderId[=:](\d{10,})',
-                    r'"updateKey"\s*:\s*"(\d{10,})',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, message_str)
-                    if match:
-                        order_id = match.group(1)
-                        logger.info(f'【{self.cookie_id}】通过正则从消息中提取到订单ID: {order_id}')
-                        break
-            
+            order_id = self._extract_order_id(message)
+            if order_id:
+                logger.info(f'【{self.cookie_id}】评价提醒消息提取到订单ID: {order_id}')
             return order_id
             
         except Exception as e:
@@ -1861,6 +1956,9 @@ class XianyuLive:
                 buyer_id=buyer_id,
                 log_prefix=log_prefix,
             )
+            normalized_status = str(status or 'failed').strip().lower()
+            if normalized_status not in {'success', 'failed', 'skipped'}:
+                normalized_status = 'failed'
             db_manager.create_delivery_log(
                 user_id=self.user_id,
                 cookie_id=self.cookie_id,
@@ -1873,7 +1971,7 @@ class XianyuLive:
                 card_type=meta.get('card_type'),
                 match_mode=meta.get('match_mode'),
                 channel=channel or 'auto',
-                status='success' if str(status).lower() == 'success' else 'failed',
+                status=normalized_status,
                 reason=self._format_delivery_log_reason(reason, meta)
             )
         except Exception as log_e:
@@ -2066,6 +2164,110 @@ class XianyuLive:
             return merged_status
         return None
 
+    def _normalize_order_amount_text(self, value: Any):
+        text = str(value or '').strip()
+        if not text:
+            return None
+        text = text.replace('¥', '').replace('￥', '').replace(',', '')
+        match = re.search(r'\d+(?:\.\d{1,2})?', text)
+        if not match:
+            return None
+        try:
+            return f"{float(match.group(0)):.2f}"
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_order_amount_float(self, value: Any):
+        normalized = self._normalize_order_amount_text(value)
+        if normalized is None:
+            return None
+        try:
+            return float(normalized)
+        except (TypeError, ValueError):
+            return None
+
+    def _has_bargain_success_evidence(self, order: dict = None) -> bool:
+        order = order or {}
+        return bool(order.get('bargain_success_detected'))
+
+    def _mark_order_bargain_flow(self, order_id: str, item_id: str = None, buyer_id: str = None,
+                                 sid: str = None, *, apply_configured_price: bool = False,
+                                 success_detected=..., context: str = '') -> bool:
+        if not order_id:
+            return False
+
+        from db_manager import db_manager
+
+        existing_order = db_manager.get_order_by_id(order_id) or {}
+        effective_item_id = item_id or existing_order.get('item_id')
+        effective_buyer_id = buyer_id or existing_order.get('buyer_id')
+        effective_sid = sid or existing_order.get('sid')
+        amount_to_save = None
+
+        if apply_configured_price and effective_item_id:
+            item_config = db_manager.get_item_info(self.cookie_id, effective_item_id)
+            configured_amount = self._normalize_order_amount_text(item_config.get('item_price') if item_config else None)
+            configured_amount_value = self._parse_order_amount_float(configured_amount)
+            existing_amount_value = self._parse_order_amount_float(existing_order.get('amount'))
+            if configured_amount_value is not None and (
+                existing_amount_value is None or configured_amount_value < existing_amount_value - 0.009
+            ):
+                amount_to_save = configured_amount
+
+        success = db_manager.insert_or_update_order(
+            order_id=order_id,
+            item_id=effective_item_id,
+            buyer_id=effective_buyer_id,
+            sid=effective_sid,
+            amount=amount_to_save,
+            cookie_id=self.cookie_id,
+            bargain_flow_detected=True,
+            bargain_success_detected=success_detected,
+        )
+
+        if success:
+            logger.info(
+                f"【{self.cookie_id}】标记订单为小刀流程: order_id={order_id}, context={context or 'unknown'}, "
+                f"apply_configured_price={apply_configured_price}, amount_override={amount_to_save or ''}, "
+                f"success_detected={success_detected if success_detected is not ... else 'unchanged'}"
+            )
+        else:
+            logger.warning(
+                f"【{self.cookie_id}】标记订单小刀流程失败: order_id={order_id}, context={context or 'unknown'}"
+            )
+        return success
+
+    def _apply_bargain_amount_override(self, order_id: str, item_id: str, amount: Any, amount_source: str,
+                                       existing_order: dict = None, item_config: dict = None):
+        existing_order = existing_order or {}
+        if not existing_order.get('bargain_flow_detected'):
+            return amount, amount_source
+
+        configured_amount = self._normalize_order_amount_text(item_config.get('item_price') if item_config else None)
+        configured_amount_value = self._parse_order_amount_float(configured_amount)
+        if configured_amount_value is None:
+            return amount, amount_source
+
+        incoming_amount = self._normalize_order_amount_text(amount)
+        incoming_amount_value = self._parse_order_amount_float(incoming_amount)
+
+        if incoming_amount_value is None:
+            logger.warning(
+                f"【{self.cookie_id}】小刀订单缺少可信金额，回退为商品配置价: "
+                f"order_id={order_id}, item_id={item_id}, configured_amount={configured_amount}"
+            )
+            return configured_amount, 'bargain_item_price_locked'
+
+        if incoming_amount_value > configured_amount_value + 0.009:
+            logger.warning(
+                f"【{self.cookie_id}】检测到小刀订单仍返回原价，使用商品配置价覆盖: "
+                f"order_id={order_id}, item_id={item_id}, incoming_amount={incoming_amount}, "
+                f"configured_amount={configured_amount}, amount_source={amount_source}"
+            )
+            return configured_amount, 'bargain_item_price_locked'
+
+        return incoming_amount, amount_source
+
     def _resolve_delivery_progress_order_status(self, current_status: str, aggregate_status: str):
         from db_manager import db_manager
 
@@ -2247,15 +2449,438 @@ class XianyuLive:
                 if order_id in self._order_detail_lock_times:
                     del self._order_detail_lock_times[order_id]
 
-            total_expired = len(expired_delivery_locks) + len(expired_detail_locks)
+            expired_refresh_marks = []
+            for order_id, refresh_info in self.order_detail_force_refresh_marks.items():
+                refresh_timestamp = refresh_info.get('timestamp', 0) if isinstance(refresh_info, dict) else 0
+                if current_time - refresh_timestamp > max_age_seconds:
+                    expired_refresh_marks.append(order_id)
+
+            for order_id in expired_refresh_marks:
+                self.order_detail_force_refresh_marks.pop(order_id, None)
+
+            total_expired = len(expired_delivery_locks) + len(expired_detail_locks) + len(expired_refresh_marks)
             if total_expired > 0:
-                logger.info(f"【{self.cookie_id}】清理了 {total_expired} 个过期锁 (发货锁: {len(expired_delivery_locks)}, 详情锁: {len(expired_detail_locks)})")
+                logger.info(
+                    f"【{self.cookie_id}】清理了 {total_expired} 个过期锁/标记 "
+                    f"(发货锁: {len(expired_delivery_locks)}, 详情锁: {len(expired_detail_locks)}, 刷新标记: {len(expired_refresh_marks)})"
+                )
                 logger.warning(f"【{self.cookie_id}】当前锁数量 - 发货锁: {len(self._order_locks)}, 详情锁: {len(self._order_detail_locks)}")
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】清理过期锁时发生错误: {self._safe_str(e)}")
 
-    
+    def _get_order_status_priority(self, status: str) -> int:
+        normalized_status = db_manager._normalize_order_status(status)
+        priority_map = {
+            'unknown': 0,
+            'processing': 10,
+            'pending_payment': 15,
+            'pending_ship': 20,
+            'partial_success': 30,
+            'partial_pending_finalize': 30,
+            'shipped': 40,
+            'completed': 50,
+            'refunding': 60,
+            'refund_cancelled': 65,
+            'cancelled': 70,
+        }
+        return priority_map.get(normalized_status or 'unknown', 0)
+
+    def _has_delivery_progress_evidence(self, order_id: str) -> bool:
+        normalized_order_id = str(order_id or '').strip()
+        if not normalized_order_id:
+            return False
+
+        try:
+            summary = self._summarize_delivery_progress(normalized_order_id, expected_quantity=1) or {}
+        except Exception as summary_error:
+            logger.warning(
+                f"【{self.cookie_id}】读取订单发货进度失败，按已有发货证据处理: "
+                f"order_id={normalized_order_id}, error={self._safe_str(summary_error)}"
+            )
+            return True
+
+        state_count = int(summary.get('state_count') or 0)
+        finalized_count = int(summary.get('finalized_count') or 0)
+        pending_finalize_count = int(summary.get('pending_finalize_count') or 0)
+        return state_count > 0 or finalized_count > 0 or pending_finalize_count > 0
+
+    def _reserve_order_detail_force_refresh(self, order_id: str, *, reason: str,
+                                            log_prefix: str = "", cooldown_seconds: float = None) -> bool:
+        normalized_order_id = str(order_id or '').strip()
+        if not normalized_order_id:
+            return False
+
+        cooldown = float(cooldown_seconds or self.order_detail_force_refresh_cooldown or 0)
+        now = time.time()
+        existing = self.order_detail_force_refresh_marks.get(normalized_order_id) or {}
+        last_timestamp = existing.get('timestamp', 0)
+        elapsed = now - last_timestamp
+
+        if last_timestamp and cooldown > 0 and elapsed < cooldown:
+            logger.info(
+                f"{log_prefix} 订单详情强刷命中冷却，跳过重复刷新: "
+                f"order_id={normalized_order_id}, reason={reason}, "
+                f"last_reason={existing.get('reason', 'unknown')}, remaining={round(cooldown - elapsed, 2)}s"
+            )
+            return False
+
+        self.order_detail_force_refresh_marks[normalized_order_id] = {
+            'timestamp': now,
+            'reason': reason,
+        }
+        return True
+
+    def _should_force_refresh_after_status_signal(self, status_signal: str, current_status: str,
+                                                  order_id: str = None) -> bool:
+        normalized_signal = db_manager._normalize_order_status(status_signal)
+        normalized_current = db_manager._normalize_order_status(current_status)
+
+        if not normalized_signal or normalized_signal == 'unknown':
+            return False
+
+        if normalized_signal == 'pending_ship':
+            if normalized_current == 'shipped' and not self._has_delivery_progress_evidence(order_id):
+                logger.warning(
+                    f"【{self.cookie_id}】检测到可疑已发货状态，允许待发货信号继续强刷详情: "
+                    f"order_id={order_id or 'unknown'}, current_status={normalized_current}, signal={normalized_signal}"
+                )
+                return True
+            return normalized_current in {None, '', 'unknown', 'processing', 'pending_payment'}
+
+        if normalized_signal == 'shipped':
+            return normalized_current in {None, '', 'unknown', 'processing', 'pending_payment', 'pending_ship'}
+
+        if normalized_signal in {'completed', 'cancelled', 'refunding', 'refund_cancelled'}:
+            if not normalized_current or normalized_current == 'unknown':
+                return True
+            return self._get_order_status_priority(normalized_signal) > self._get_order_status_priority(normalized_current)
+
+        return False
+
+    def _should_accept_order_detail_status_correction(self, current_status: str, incoming_status: str,
+                                                      incoming_source: str, *, force_refresh: bool,
+                                                      order_id: str = None) -> bool:
+        normalized_current = db_manager._normalize_order_status(current_status)
+        normalized_incoming = db_manager._normalize_order_status(incoming_status)
+        normalized_source = str(incoming_source or 'unknown').strip().lower()
+
+        if not force_refresh:
+            return False
+        if normalized_current != 'shipped' or normalized_incoming != 'pending_ship':
+            return False
+        if normalized_source not in {'selector', 'button'}:
+            return False
+        if self._has_delivery_progress_evidence(order_id):
+            return False
+        return True
+
+    def _should_reject_order_detail_status_update(self, current_status: str, incoming_status: str,
+                                                  incoming_source: str, *, force_refresh: bool) -> bool:
+        normalized_current = db_manager._normalize_order_status(current_status)
+        normalized_incoming = db_manager._normalize_order_status(incoming_status)
+        normalized_source = str(incoming_source or 'unknown').strip().lower()
+
+        if normalized_incoming != 'completed' or normalized_source != 'body':
+            return False
+
+        if force_refresh and normalized_current in {'shipped', 'pending_ship', 'partial_success', 'partial_pending_finalize'}:
+            return True
+
+        return False
+
+    async def _maybe_force_refresh_order_detail_for_signal(self, order_id: str, *, item_id: str = None,
+                                                           buyer_id: str = None, sid: str = None,
+                                                           buyer_nick: str = None, status_signal: str = None,
+                                                           reason: str = "status_signal",
+                                                           delay_seconds: float = 0,
+                                                           log_prefix: str = "") -> bool:
+        normalized_order_id = str(order_id or '').strip()
+        if not normalized_order_id:
+            return False
+
+        current_order = db_manager.get_order_by_id(normalized_order_id) or {}
+        current_status = current_order.get('order_status')
+        if not self._should_force_refresh_after_status_signal(status_signal, current_status, normalized_order_id):
+            logger.info(
+                f"{log_prefix} 当前订单状态无需为该信号强刷详情: order_id={normalized_order_id}, "
+                f"signal={status_signal or 'unknown'}, current_status={current_status or 'unknown'}"
+            )
+            return False
+
+        if not self._reserve_order_detail_force_refresh(
+            normalized_order_id,
+            reason=reason,
+            log_prefix=log_prefix,
+        ):
+            return False
+
+        if delay_seconds and delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        latest_order = db_manager.get_order_by_id(normalized_order_id) or {}
+        latest_status = latest_order.get('order_status')
+        if not self._should_force_refresh_after_status_signal(status_signal, latest_status, normalized_order_id):
+            logger.info(
+                f"{log_prefix} 延迟后订单状态已更新，无需再强刷详情: order_id={normalized_order_id}, "
+                f"signal={status_signal or 'unknown'}, current_status={latest_status or 'unknown'}"
+            )
+            return False
+
+        refresh_item_id = item_id or latest_order.get('item_id')
+        refresh_buyer_id = buyer_id or latest_order.get('buyer_id')
+        logger.info(
+            f"{log_prefix} 状态信号触发订单详情强刷: order_id={normalized_order_id}, "
+            f"signal={status_signal or 'unknown'}, current_status={latest_status or 'unknown'}, reason={reason}"
+        )
+
+        try:
+            await self.fetch_order_detail_info(
+                order_id=normalized_order_id,
+                item_id=refresh_item_id,
+                buyer_id=refresh_buyer_id,
+                sid=sid,
+                buyer_nick=buyer_nick,
+                force_refresh=True
+            )
+            return True
+        except Exception as refresh_error:
+            logger.error(
+                f"{log_prefix} 状态信号触发订单详情强刷失败: order_id={normalized_order_id}, "
+                f"reason={reason}, error={self._safe_str(refresh_error)}"
+            )
+            return False
+
+
+    def _load_json_dict(self, raw_value: Any) -> Dict[str, Any]:
+        """安全解析 JSON 对象。"""
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _extract_message_card_payload(self, message_1: Any) -> Dict[str, Any]:
+        """提取消息卡片 JSON 载荷。"""
+        if not isinstance(message_1, dict):
+            return {}
+
+        try:
+            message_6 = message_1.get('6', {})
+            if not isinstance(message_6, dict):
+                return {}
+            message_6_3 = message_6.get('3', {})
+            if not isinstance(message_6_3, dict):
+                return {}
+            payload = message_6_3.get('5', '')
+            return self._load_json_dict(payload)
+        except Exception:
+            return {}
+
+    def _extract_message_button_text(self, message_1: Any) -> str:
+        """提取消息卡片按钮文本。"""
+        payload = self._extract_message_card_payload(message_1)
+        try:
+            return str(
+                payload.get('dxCard', {})
+                .get('item', {})
+                .get('main', {})
+                .get('exContent', {})
+                .get('button', {})
+                .get('text', '')
+            ).strip()
+        except Exception:
+            return ''
+
+    def _extract_message_card_title(self, message_1: Any) -> str:
+        """提取消息卡片标题。"""
+        payload = self._extract_message_card_payload(message_1)
+        try:
+            return str(
+                payload.get('dxCard', {})
+                .get('item', {})
+                .get('main', {})
+                .get('exContent', {})
+                .get('title', '')
+            ).strip()
+        except Exception:
+            return ''
+
+    def _classify_message_route(self, *, message: dict, message_1: dict, message_10: dict,
+                                send_message: str) -> Dict[str, Any]:
+        """将消息路由到订单状态、系统提示、特殊流程或真人聊天。"""
+        message_direction = message_1.get('7', 0) if isinstance(message_1, dict) else 0
+        content_type = 0
+        try:
+            message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
+            if isinstance(message_6, dict):
+                message_6_3 = message_6.get('3', {})
+                if isinstance(message_6_3, dict):
+                    content_type = message_6_3.get('4', 0)
+        except Exception:
+            content_type = 0
+
+        biz_tag_raw = str(message_10.get('bizTag', '') or '').strip()
+        biz_tag_dict = self._load_json_dict(biz_tag_raw)
+        ext_json_dict = self._load_json_dict(message_10.get('extJson', ''))
+        task_name = str(biz_tag_dict.get('taskName') or '').strip()
+        update_key = str(ext_json_dict.get('updateKey') or '').strip()
+        detail_notice = str(message_10.get('detailNotice', '') or '').strip()
+        reminder_content = str(message_10.get('reminderContent', '') or send_message or '').strip()
+        reminder_title = str(message_10.get('reminderTitle', '') or '').strip()
+        reminder_notice = str(message_10.get('reminderNotice', '') or '').strip()
+        red_reminder = ''
+        if isinstance(message, dict) and isinstance(message.get('3'), dict):
+            red_reminder = str(message.get('3', {}).get('redReminder', '') or '').strip()
+
+        button_text = self._extract_message_button_text(message_1)
+        card_title = self._extract_message_card_title(message_1)
+        session_type = str(message_10.get('sessionType', '1') or '1').strip()
+        is_group_message = session_type == '30'
+        is_system_biz = bool(task_name) or 'SECURITY' in biz_tag_raw or 'taskId' in biz_tag_raw
+        is_system_message = message_direction == 1 or content_type == 6 or is_system_biz
+
+        texts = []
+        for raw_text in (
+            send_message,
+            reminder_content,
+            detail_notice,
+            reminder_title,
+            reminder_notice,
+            red_reminder,
+            task_name,
+            update_key,
+            button_text,
+            card_title,
+        ):
+            normalized_text = str(raw_text or '').strip()
+            if normalized_text and normalized_text not in texts:
+                texts.append(normalized_text)
+
+        special_flow_messages = {
+            '[卡片消息]',
+            '快给ta一个评价吧~',
+            '快给ta一个评价吧～',
+        }
+        special_flow_titles = {
+            '我已小刀，待刀成',
+            '我已小刀,待刀成',
+            '我已成功小刀，待发货',
+            '我已成功小刀,待发货',
+        }
+
+        if send_message in special_flow_messages or card_title in special_flow_titles:
+            route = 'special_flow'
+            order_status_signal = None
+        else:
+            order_status_signal = None
+            closed_markers = (
+                '[你关闭了订单，钱款已原路退返]',
+                '交易关闭',
+                '订单关闭',
+                '钱款已原路退返',
+            )
+            refund_markers = (
+                '退款中',
+                '退款成功',
+                '退货退款',
+                '退款关闭',
+            )
+            completed_markers = (
+                '[买家确认收货，交易成功]',
+                '[你已确认收货，交易成功]',
+                '买家确认收货',
+                '交易成功',
+            )
+            shipped_markers = (
+                '[你已发货]',
+                '已发货',
+                '等待买家收货',
+            )
+            pending_ship_markers = (
+                '[我已付款，等待你发货]',
+                '[已付款，待发货]',
+                '我已付款，等待你发货',
+                '[记得及时发货]',
+                '等待你发货',
+                '待发货',
+                '去发货',
+                '付款完成待发货',
+                'TRADE_PAID_DONE_SELLER',
+            )
+            pending_payment_markers = (
+                '[我已拍下，待付款]',
+                '买家已拍下，待付款',
+                '待付款',
+                '等待买家付款',
+                '已拍下_未付款',
+            )
+            system_notice_markers = (
+                '闲鱼小红花',
+                '温馨提醒',
+                '曝光卡',
+                '蚂蚁森林',
+                '能量可领',
+                '创建合约',
+                '假客服骗钱',
+                '订单即将自动确认收货',
+                '宝贝性价比如何，去表个态吧',
+                '发来一条消息',
+                '发来一条新消息',
+                '已送出小红花',
+                '已收下',
+            )
+
+            def _contains_any(markers) -> bool:
+                return any(marker and marker in text for text in texts for marker in markers)
+
+            if _contains_any(closed_markers):
+                order_status_signal = 'cancelled'
+            elif _contains_any(refund_markers):
+                order_status_signal = 'refunding'
+            elif _contains_any(completed_markers):
+                order_status_signal = 'completed'
+            elif _contains_any(shipped_markers):
+                order_status_signal = 'shipped'
+            elif _contains_any(pending_ship_markers):
+                order_status_signal = 'pending_ship'
+            elif _contains_any(pending_payment_markers):
+                order_status_signal = 'pending_payment'
+
+            if is_system_message and order_status_signal:
+                route = 'order_status'
+            elif _contains_any(system_notice_markers) and (is_system_message or message_direction != 2):
+                route = 'system_notice'
+            elif is_system_message:
+                route = 'system_notice'
+            else:
+                route = 'user_chat'
+
+        should_notify = False
+        if not is_group_message:
+            if route == 'user_chat':
+                should_notify = True
+            elif route == 'order_status' and order_status_signal in {'pending_ship', 'refunding', 'cancelled'}:
+                should_notify = True
+
+        return {
+            'route': route,
+            'order_status_signal': order_status_signal,
+            'should_notify': should_notify,
+            'allow_auto_reply': route == 'user_chat',
+            'is_system_message': is_system_message,
+            'is_group_message': is_group_message,
+            'message_direction': message_direction,
+            'content_type': content_type,
+            'task_name': task_name,
+            'button_text': button_text,
+            'card_title': card_title,
+            'texts': texts,
+        }
 
     def _is_auto_delivery_trigger(self, message: str) -> bool:
         """检查消息是否为自动发货触发关键字"""
@@ -2275,6 +2900,98 @@ class XianyuLive:
 
         return False
 
+    def _extract_order_id_from_update_key(self, raw_text: Any) -> Optional[str]:
+        normalized_text = str(raw_text or '').strip()
+        if not normalized_text:
+            return None
+
+        direct_match_found = False
+        direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
+        if direct_match:
+            direct_match_found = True
+            normalized_text = direct_match.group(1)
+
+        colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
+        long_numeric_parts = [part for part in colon_parts if part.isdigit() and len(part) >= 16]
+        if long_numeric_parts:
+            return long_numeric_parts[0]
+
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
+        return None
+
+    def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
+        normalized_text = str(raw_text or '').strip()
+        if not normalized_text:
+            return None
+
+        patterns = [
+            r'orderId(?:=|:|%3[Dd]|\\u003[dD])\s*"?(\d{10,})',
+            r'bizOrderId["\']?\s*[:=]\s*"?(\d{10,})',
+            r'order[_-]?id["\']?\s*[:=]\s*"?(\d{10,})',
+            r'order[_-]?detail\?(?:[^\s#]*?&)?id=(\d{10,})',
+            r'order-detail\?(?:[^\s#]*?&)?orderId=(\d{10,})',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, normalized_text)
+            if match:
+                return match.group(1)
+
+        source_lower = source.lower()
+        text_lower = normalized_text.lower()
+        if (
+            'updatekey' in source_lower
+            or 'updatekey' in text_lower
+            or ('trade_' in text_lower and ':' in normalized_text)
+            or ('buyer_confirm' in text_lower and ':' in normalized_text)
+        ):
+            return self._extract_order_id_from_update_key(normalized_text)
+
+        return None
+
+    def _collect_order_id_candidate_texts(self, data: Any, root: str = 'message'):
+        candidates = []
+        seen = set()
+
+        def add_candidate(source: str, value: Any):
+            if value is None:
+                return
+            normalized_text = str(value).strip()
+            if not normalized_text:
+                return
+            dedupe_key = (source, normalized_text)
+            if dedupe_key in seen:
+                return
+            seen.add(dedupe_key)
+            candidates.append((source, normalized_text))
+
+            if normalized_text[:1] in {'{', '['}:
+                try:
+                    parsed_value = json.loads(normalized_text)
+                except Exception:
+                    return
+                walk_value(parsed_value, f'{source}.json')
+
+        def walk_value(value: Any, source: str):
+            if isinstance(value, dict):
+                for key, nested_value in value.items():
+                    nested_source = f'{source}.{key}'
+                    if isinstance(nested_value, (dict, list)):
+                        walk_value(nested_value, nested_source)
+                    else:
+                        add_candidate(nested_source, nested_value)
+            elif isinstance(value, list):
+                for index, nested_value in enumerate(value[:20]):
+                    walk_value(nested_value, f'{source}[{index}]')
+            else:
+                add_candidate(source, value)
+
+        walk_value(data, root)
+        return candidates
+
     def _extract_order_id(self, message: dict, raw_message_data: dict = None) -> str:
         """从消息中提取订单ID
         
@@ -2283,177 +3000,48 @@ class XianyuLive:
             raw_message_data: 原始的WebSocket消息数据（用于在解密消息中找不到订单ID时进行搜索）
         """
         try:
-            order_id = None
-
             # 先查看消息的完整结构
             logger.warning(f"【{self.cookie_id}】🔍 完整消息结构: {message}")
 
-            # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
-            message_1 = message.get('1', {})
-            content_json_str = ''
+            for source, candidate_text in self._collect_order_id_candidate_texts(message, root='message'):
+                order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
+                if order_id:
+                    logger.info(f'【{self.cookie_id}】🎯 最终提取到订单ID: {order_id} (source={source})')
+                    return order_id
 
-            if isinstance(message_1, dict):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
+            if raw_message_data:
+                logger.info(f'【{self.cookie_id}】🔍 尝试从原始消息数据中搜索订单ID')
+                for source, candidate_text in self._collect_order_id_candidate_texts(raw_message_data, root='raw_message'):
+                    order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
+                    if order_id:
+                        logger.info(f'【{self.cookie_id}】🎯 从原始消息提取到订单ID: {order_id} (source={source})')
+                        return order_id
 
-                # 检查message['1']['6']的结构
-                message_1_6 = message_1.get('6', {})
-                if isinstance(message_1_6, dict):
-                    logger.warning(f"【{self.cookie_id}】🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
-                    # 方法1: 从button的targetUrl中提取orderId
-                    content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
-                else:
-                    logger.warning(f"【{self.cookie_id}】🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
-
-            elif isinstance(message_1, list):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是列表，长度: {len(message_1)}")
-                # 如果message['1']是列表，跳过这种提取方式
-
-            elif isinstance(message_1, str):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是字符串，长度: {len(message_1)}")
-                # 如果message['1']是字符串，跳过这种提取方式
-
-            else:
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 未知类型: {type(message_1)}")
-                # 其他类型，跳过这种提取方式
-
-            if content_json_str:
-                try:
-                    content_data = json.loads(content_json_str)
-
-                    # 方法1a: 从button的targetUrl中提取orderId
-                    target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
-                    if target_url:
-                        # 从URL中提取orderId参数
-                        order_match = re.search(r'orderId=(\d+)', target_url)
-                        if order_match:
-                            order_id = order_match.group(1)
-                            logger.info(f'【{self.cookie_id}】✅ 从button提取到订单ID: {order_id}')
-
-                    # 方法1b: 从main的targetUrl中提取order_detail的id
-                    if not order_id:
-                        main_target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('targetUrl', '')
-                        if main_target_url:
-                            order_match = re.search(r'order_detail\?id=(\d+)', main_target_url)
-                            if order_match:
-                                order_id = order_match.group(1)
-                                logger.info(f'【{self.cookie_id}】✅ 从main targetUrl提取到订单ID: {order_id}')
-
-                except Exception as parse_e:
-                    logger.warning(f"解析内容JSON失败: {parse_e}")
-
-            # 方法2: 从dynamicOperation中的order_detail URL提取orderId
-            if not order_id and content_json_str:
-                try:
-                    content_data = json.loads(content_json_str)
-                    dynamic_target_url = content_data.get('dynamicOperation', {}).get('changeContent', {}).get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
-                    if dynamic_target_url:
-                        # 从order_detail URL中提取id参数
-                        order_match = re.search(r'order_detail\?id=(\d+)', dynamic_target_url)
-                        if order_match:
-                            order_id = order_match.group(1)
-                            logger.info(f'【{self.cookie_id}】✅ 从order_detail提取到订单ID: {order_id}')
-                except Exception as parse_e:
-                    logger.warning(f"解析dynamicOperation JSON失败: {parse_e}")
-
-            # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
-            if not order_id:
-                try:
-                    # 将整个消息转换为字符串进行搜索
-                    message_str = str(message)
-
-                    # 搜索各种可能的订单ID模式
-                    patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
-                        r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
-                        r'"id"\s*:\s*"?(\d{10,})"?',  # "id":"123456789" 或 "id":123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
-                    ]
-
-                    for pattern in patterns:
-                        matches = re.findall(pattern, message_str)
-                        if matches:
-                            # 取第一个匹配的订单ID
-                            order_id = matches[0]
-                            logger.info(f'【{self.cookie_id}】✅ 从消息字符串中提取到订单ID: {order_id} (模式: {pattern})')
-                            break
-
-                except Exception as search_e:
-                    logger.warning(f"在消息字符串中搜索订单ID失败: {search_e}")
-
-            # 方法4: 如果以上方法都失败且提供了原始消息数据，尝试从原始消息中提取
-            if not order_id and raw_message_data:
-                try:
-                    # 将原始消息转换为字符串进行搜索
-                    raw_message_str = json.dumps(raw_message_data, ensure_ascii=False) if isinstance(raw_message_data, dict) else str(raw_message_data)
-                    logger.info(f'【{self.cookie_id}】🔍 尝试从原始消息数据中搜索订单ID (长度: {len(raw_message_str)})')
-
-                    # 搜索各种可能的订单ID模式
-                    patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
-                        r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
-                    ]
-
-                    for pattern in patterns:
-                        matches = re.findall(pattern, raw_message_str)
-                        if matches:
-                            # 取第一个匹配的订单ID
-                            order_id = matches[0]
-                            logger.info(f'【{self.cookie_id}】✅ 从原始消息数据中提取到订单ID: {order_id} (模式: {pattern})')
-                            break
-
-                except Exception as raw_search_e:
-                    logger.warning(f"在原始消息数据中搜索订单ID失败: {raw_search_e}")
-
-            # 方法5: 尝试遍历原始消息中的所有syncPushPackage.data元素
-            if not order_id and raw_message_data:
                 try:
                     sync_data_list = raw_message_data.get("body", {}).get("syncPushPackage", {}).get("data", [])
-                    if len(sync_data_list) > 1:
-                        logger.info(f'【{self.cookie_id}】🔍 发现{len(sync_data_list)}个data元素，尝试遍历提取订单ID')
-                        
-                        for idx, sync_data_item in enumerate(sync_data_list):
+                    for idx, sync_data_item in enumerate(sync_data_list[:20]):
+                        if not isinstance(sync_data_item, dict) or "data" not in sync_data_item:
+                            continue
+
+                        item_data = sync_data_item.get("data")
+                        if item_data is None:
+                            continue
+
+                        try:
+                            decoded_data = base64.b64decode(item_data).decode("utf-8")
+                        except Exception:
+                            decoded_data = item_data
+
+                        for source, candidate_text in self._collect_order_id_candidate_texts(decoded_data, root=f'raw_sync[{idx}]'):
+                            order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
                             if order_id:
-                                break
-                            
-                            if "data" not in sync_data_item:
-                                continue
-                                
-                            try:
-                                item_data = sync_data_item["data"]
-                                # 尝试base64解码
-                                try:
-                                    decoded_data = base64.b64decode(item_data).decode("utf-8")
-                                except Exception:
-                                    decoded_data = item_data
-                                
-                                # 在解码后的数据中搜索订单ID
-                                patterns = [
-                                    r'orderId[=:](\d{10,})',
-                                    r'order_detail\?id=(\d{10,})',
-                                    r'bizOrderId[=:](\d{10,})',
-                                ]
-                                
-                                for pattern in patterns:
-                                    matches = re.findall(pattern, decoded_data)
-                                    if matches:
-                                        order_id = matches[0]
-                                        logger.info(f'【{self.cookie_id}】✅ 从data[{idx}]中提取到订单ID: {order_id} (模式: {pattern})')
-                                        break
-                                        
-                            except Exception as item_e:
-                                logger.debug(f"处理data[{idx}]时出错: {item_e}")
-                                continue
-                                
+                                logger.info(f'【{self.cookie_id}】🎯 从syncPushPackage.data提取到订单ID: {order_id} (source={source})')
+                                return order_id
                 except Exception as multi_data_e:
                     logger.warning(f"遍历syncPushPackage.data时出错: {multi_data_e}")
 
-            if order_id:
-                logger.info(f'【{self.cookie_id}】🎯 最终提取到订单ID: {order_id}')
-            else:
-                logger.warning(f'【{self.cookie_id}】❌ 未能从消息中提取到订单ID')
-
-            return order_id
+            logger.warning(f'【{self.cookie_id}】❌ 未能从消息中提取到订单ID')
+            return None
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
@@ -2515,7 +3103,7 @@ class XianyuLive:
                     order_id=order_id,
                     item_id=item_id,
                     buyer_id=user_id,
-                    status='failed',
+                    status='skipped',
                     reason='订单在冷却期内，跳过发货',
                     channel='auto'
                 )
@@ -2529,7 +3117,7 @@ class XianyuLive:
                     order_id=order_id,
                     item_id=item_id,
                     buyer_id=user_id,
-                    status='failed',
+                    status='skipped',
                     reason='订单延迟锁持有中，跳过发货',
                     channel='auto'
                 )
@@ -2549,7 +3137,7 @@ class XianyuLive:
                         order_id=order_id,
                         item_id=item_id,
                         buyer_id=user_id,
-                        status='failed',
+                        status='skipped',
                         reason='获取锁后发现订单已处理，跳过发货',
                         channel='auto'
                     )
@@ -2878,10 +3466,21 @@ class XianyuLive:
 
                 if fallback_sid:
                     try:
+                        log_prefix = f'[{msg_time}] 【{self.cookie_id}】'
+                        sid_lookup_minutes = 5
                         sid_lookup = self._lookup_delivery_order_by_sid(
                             fallback_sid,
-                            minutes=10,
-                            log_prefix=f'[{msg_time}] 【{self.cookie_id}】'
+                            minutes=sid_lookup_minutes,
+                            log_prefix=log_prefix
+                        )
+                        sid_lookup = await self._refresh_sid_lookup_if_needed(
+                            fallback_sid,
+                            sid_lookup,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
+                            minutes=sid_lookup_minutes,
+                            allow_bargain_ready=True,
+                            log_prefix=log_prefix
                         )
                     except Exception as sid_query_e:
                         logger.error(f'[{msg_time}] 【{self.cookie_id}】sid兜底查单异常: {self._safe_str(sid_query_e)}')
@@ -2890,7 +3489,7 @@ class XianyuLive:
                     recent_order = sid_lookup.get('order')
                     sid_match_type = sid_lookup.get('match_type', 'missing')
 
-                    if recent_order and sid_match_type == 'pending_ship':
+                    if recent_order and sid_match_type in {'pending_ship', 'bargain_ready'}:
                         fallback_order_id = recent_order.get('order_id')
                         fallback_item_id = recent_order.get('item_id')
                         fallback_buyer_id = recent_order.get('buyer_id')
@@ -2914,6 +3513,12 @@ class XianyuLive:
                         order_id = fallback_order_id
                         if (not item_id or item_id == "未知商品") and fallback_item_id:
                             item_id = fallback_item_id
+
+                        if sid_match_type == 'bargain_ready':
+                            logger.info(
+                                f'[{msg_time}] 【{self.cookie_id}】✅ 订单ID提取失败，但检测到小刀成功证据，'
+                                f'使用sid兜底直接进入自动发货: sid={fallback_sid}, order_id={order_id}'
+                            )
 
                         logger.info(
                             f'[{msg_time}] 【{self.cookie_id}】✅ 订单ID提取失败，已通过sid兜底定位订单: '
@@ -3453,8 +4058,8 @@ class XianyuLive:
             try:
                 from db_manager import db_manager
                 account_info = db_manager.get_cookie_details(self.cookie_id)
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
+                new_cookies_str = self._extract_cookie_value(account_info)
+                if new_cookies_str:
                     if new_cookies_str != self.cookies_str:
                         logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                         self.cookies_str = new_cookies_str
@@ -6767,19 +7372,59 @@ Cookie数量: {cookie_count}
                             return None
                         return text
 
+                    def _parse_amount_float(value):
+                        text = _normalize_amount_text(value)
+                        if not text:
+                            return None
+                        try:
+                            return float(text)
+                        except (TypeError, ValueError):
+                            return None
+
                     # 获取解析后的规格信息
+                    spec_parse_mode = str(result.get('spec_parse_mode') or '').strip() or 'no_spec'
                     spec_name = _normalize_optional_text(result.get('spec_name'))
                     spec_value = _normalize_optional_text(result.get('spec_value'))
                     spec_name_2 = _normalize_optional_text(result.get('spec_name_2'))
                     spec_value_2 = _normalize_optional_text(result.get('spec_value_2'))
                     quantity = _normalize_optional_text(result.get('quantity'))
                     amount = _normalize_amount_text(result.get('amount'))
+                    amount_source = _normalize_optional_text(result.get('amount_source')) or 'unknown'
+                    item_config = db_manager.get_item_info(self.cookie_id, item_id) if item_id else None
+                    item_config_multi_spec = bool(item_config and item_config.get('is_multi_spec'))
+                    item_config_detail = _normalize_optional_text(item_config.get('item_detail')) if item_config else None
+                    is_coin_deduction_item = bool(item_config_detail and '闲鱼币抵扣' in item_config_detail)
+                    configured_item_amount = _normalize_amount_text(item_config.get('item_price')) if item_config else None
+                    configured_item_amount_value = _parse_amount_float(configured_item_amount)
+
+                    if item_config is not None and not item_config_multi_spec and any(
+                        [spec_name, spec_value, spec_name_2, spec_value_2]
+                    ):
+                        logger.warning(
+                            f"【{self.cookie_id}】商品配置为无规格，刷新订单详情时忽略解析到的规格信息: "
+                            f"order_id={order_id}, item_id={item_id}, "
+                            f"spec={spec_name or ''}:{spec_value or ''}, spec2={spec_name_2 or ''}:{spec_value_2 or ''}"
+                        )
+                        spec_name = None
+                        spec_value = None
+                        spec_name_2 = None
+                        spec_value_2 = None
+
+                    if spec_parse_mode == 'one_spec' and spec_name and spec_value and not (spec_name_2 or spec_value_2):
+                        spec_name_2 = ''
+                        spec_value_2 = ''
+                        logger.info(
+                            f"【{self.cookie_id}】订单详情明确解析为单规格，允许清空历史残留的第二规格字段: "
+                            f"order_id={order_id}, item_id={item_id}, spec={spec_name}:{spec_value}"
+                        )
+
                     # 获取订单状态（从闲鱼页面解析）
                     raw_order_status = _normalize_optional_text(result.get('order_status'))
+                    order_status_source = _normalize_optional_text(result.get('order_status_source')) or 'unknown'
                     # unknown 视为解析失败，不覆盖已有状态
                     order_status = raw_order_status if raw_order_status and raw_order_status.lower() != 'unknown' else None
                     if order_status:
-                        logger.info(f"【{self.cookie_id}】📊 订单状态: {order_status}")
+                        logger.info(f"【{self.cookie_id}】📊 订单状态: {order_status} (source={order_status_source})")
                     elif raw_order_status and raw_order_status.lower() == 'unknown':
                         logger.warning(f"【{self.cookie_id}】订单状态解析为unknown，跳过状态字段写库")
 
@@ -6796,11 +7441,90 @@ Cookie数量: {cookie_count}
                         logger.warning(f"【{self.cookie_id}】未获取到有效的规格信息")
                         print(f"⚠️ 【{self.cookie_id}】订单 {order_id} 规格信息获取失败")
 
+                    if amount:
+                        logger.info(f"【{self.cookie_id}】💰 订单金额: {amount} (source={amount_source})")
+
                     # 插入或更新订单信息到数据库
                     try:
                         # 对于系统消息误识别出的“自己是买家”场景，保留已有买家信息并继续刷新订单字段
                         existing_order = db_manager.get_order_by_id(order_id)
                         current_order_status = existing_order.get('order_status') if existing_order else None
+                        existing_amount = existing_order.get('amount') if existing_order else None
+                        existing_amount_value = _parse_amount_float(existing_amount)
+                        amount, amount_source = self._apply_bargain_amount_override(
+                            order_id,
+                            item_id,
+                            amount,
+                            amount_source,
+                            existing_order=existing_order,
+                            item_config=item_config,
+                        )
+                        incoming_amount_value = _parse_amount_float(amount)
+                        has_valid_spec = bool(spec_name and spec_value)
+                        low_confidence_amount_sources = {
+                            'selector_direct',
+                            'selector_currency',
+                            'text_currency',
+                            'unknown',
+                        }
+
+                        if (
+                            is_coin_deduction_item and existing_amount_value is not None and incoming_amount_value is not None and
+                            configured_item_amount_value is not None and existing_amount_value + 0.009 < configured_item_amount_value and
+                            abs(incoming_amount_value - configured_item_amount_value) <= 0.009
+                        ):
+                            logger.warning(
+                                f"【{self.cookie_id}】闲鱼币抵扣订单返回原价，保留已有实付金额: "
+                                f"order_id={order_id}, existing_amount={existing_amount}, incoming_amount={amount}, "
+                                f"configured_amount={configured_item_amount}, amount_source={amount_source}"
+                            )
+                            amount = _normalize_amount_text(existing_amount)
+                            amount_source = 'coin_deduction_preserved_existing'
+                            incoming_amount_value = _parse_amount_float(amount)
+
+                        if amount and amount_source in low_confidence_amount_sources and not has_valid_spec and not order_status:
+                            if existing_amount_value is not None:
+                                logger.warning(
+                                    f"【{self.cookie_id}】订单详情返回低置信度金额，保留已有金额: "
+                                    f"order_id={order_id}, existing_amount={existing_amount}, incoming_amount={amount}, "
+                                    f"amount_source={amount_source}"
+                                )
+                                amount = _normalize_amount_text(existing_amount)
+                                amount_source = 'preserved_existing'
+                            else:
+                                logger.warning(
+                                    f"【{self.cookie_id}】订单详情返回低置信度金额，且缺少规格/状态佐证，跳过写库: "
+                                    f"order_id={order_id}, incoming_amount={amount}, amount_source={amount_source}"
+                                )
+                                amount = None
+
+                        elif (
+                            amount and existing_amount_value is not None and incoming_amount_value is not None and
+                            abs(existing_amount_value - incoming_amount_value) > 0.009 and
+                            not has_valid_spec and not order_status and
+                            amount_source not in {'selector_keyword_high', 'selector_keyword_low', 'text_keyword_high', 'text_keyword_low', 'cache'}
+                        ):
+                            logger.warning(
+                                f"【{self.cookie_id}】订单详情金额跳变且缺少规格/状态佐证，保留已有金额: "
+                                f"order_id={order_id}, existing_amount={existing_amount}, incoming_amount={amount}, "
+                                f"amount_source={amount_source}"
+                            )
+                            amount = _normalize_amount_text(existing_amount)
+                            amount_source = 'preserved_existing'
+
+                        if self._should_reject_order_detail_status_update(
+                            current_status=current_order_status,
+                            incoming_status=order_status,
+                            incoming_source=order_status_source,
+                            force_refresh=force_refresh,
+                        ):
+                            logger.warning(
+                                f"【{self.cookie_id}】强制刷新结果仅来自正文，拒绝将订单状态更新为completed: "
+                                f"order_id={order_id}, current={current_order_status}, incoming={order_status}, "
+                                f"source={order_status_source}"
+                            )
+                            order_status = None
+
                         normalized_current_order_status = db_manager._normalize_order_status(current_order_status)
                         normalized_incoming_order_status = db_manager._normalize_order_status(order_status)
                         buyer_id_to_save = buyer_id
@@ -6809,11 +7533,25 @@ Cookie数量: {cookie_count}
                             source="order_detail",
                             log_prefix=f"【{self.cookie_id}】"
                         )
-                        order_status_to_save = self._resolve_external_order_status(
+                        if self._should_accept_order_detail_status_correction(
                             current_order_status,
                             order_status,
-                            source='order_detail_refresh'
-                        )
+                            order_status_source,
+                            force_refresh=force_refresh,
+                            order_id=order_id,
+                        ):
+                            order_status_to_save = normalized_incoming_order_status
+                            logger.warning(
+                                f"【{self.cookie_id}】检测到可疑已发货状态，允许强刷后的结构化待发货结果纠偏: "
+                                f"order_id={order_id}, current={current_order_status}, incoming={order_status}, "
+                                f"source={order_status_source}"
+                            )
+                        else:
+                            order_status_to_save = self._resolve_external_order_status(
+                                current_order_status,
+                                order_status,
+                                source='order_detail_refresh'
+                            )
 
                         if (
                             order_status and existing_order and order_status_to_save is None and
@@ -6977,6 +7715,7 @@ Cookie数量: {cookie_count}
                     logger.info(f"从数据库获取商品信息: {item_id}")
                     db_item_info = db_manager.get_item_info(self.cookie_id, item_id)
                     if db_item_info:
+                        item_info = db_item_info
                         # 拼接商品标题和详情作为搜索文本
                         item_title_db = db_item_info.get('item_title', '') or ''
                         item_detail_db = db_item_info.get('item_detail', '') or ''
@@ -7123,12 +7862,17 @@ Cookie数量: {cookie_count}
             order_spec_mode = _get_order_spec_mode()
             item_config_mode = 'spec_enabled' if item_config_multi_spec else 'no_spec'
 
-            if order_spec_mode != 'no_spec' and not item_config_multi_spec:
+            if order_spec_mode != 'no_spec' and item_info is not None and not item_config_multi_spec:
                 logger.warning(
-                    f"商品配置为无规格，但订单解析到实际规格，继续按订单规格严格匹配: "
+                    f"商品已配置为无规格，忽略订单解析到的规格并按普通规则匹配: "
                     f"order_spec_mode={order_spec_mode}, item_id={item_id or 'unknown'}, "
-                    f"order_id={order_id or 'unknown'}"
+                    f"order_id={order_id or 'unknown'}, spec={spec_name}:{spec_value}"
                 )
+                spec_name = ''
+                spec_value = ''
+                spec_name_2 = ''
+                spec_value_2 = ''
+                order_spec_mode = _get_order_spec_mode()
             elif order_spec_mode == 'no_spec' and item_config_multi_spec:
                 block_reason = (
                     f"商品已开启规格匹配，但订单未解析到有效规格信息，已阻断自动发货: "
@@ -8782,6 +9526,42 @@ Cookie数量: {cookie_count}
             for cookie in updated_cookies:
                 real_cookies_dict[cookie['name']] = cookie['value']
 
+            # 现有账号不要直接整包覆盖旧Cookie，保留扫码前已经存在但本次页面未返回的字段
+            from db_manager import db_manager
+            existing_cookie = db_manager.get_cookie_details(target_cookie_id)
+            existing_cookie_value = self._extract_cookie_value(existing_cookie)
+            if existing_cookie_value:
+                try:
+                    existing_cookies_dict = trans_cookies(existing_cookie_value)
+                    if existing_cookies_dict:
+                        merged_cookies_dict = existing_cookies_dict.copy()
+                        updated_fields = []
+
+                        for name, value in real_cookies_dict.items():
+                            old_value = merged_cookies_dict.get(name)
+                            if old_value is None:
+                                updated_fields.append(f"{name}(新增)")
+                            elif old_value != value:
+                                updated_fields.append(name)
+                            merged_cookies_dict[name] = value
+
+                        preserved_fields = [name for name in existing_cookies_dict.keys() if name not in real_cookies_dict]
+                        preserved_x5_fields = [
+                            name for name in preserved_fields
+                            if name.lower().startswith('x5') or 'x5sec' in name.lower()
+                        ]
+
+                        if updated_fields:
+                            logger.info(f"【{target_cookie_id}】扫码登录合并更新Cookie字段: {', '.join(updated_fields)}")
+                        if preserved_fields:
+                            logger.info(f"【{target_cookie_id}】扫码登录保留现有Cookie字段 ({len(preserved_fields)}个): {', '.join(preserved_fields)}")
+                        if preserved_x5_fields:
+                            logger.warning(f"【{target_cookie_id}】扫码登录保留风控Cookie字段: {', '.join(preserved_x5_fields)}")
+
+                        real_cookies_dict = merged_cookies_dict
+                except Exception as merge_e:
+                    logger.warning(f"【{target_cookie_id}】合并现有账号Cookie失败，继续使用扫码获取到的Cookie: {self._safe_str(merge_e)}")
+
             # 生成真实cookie字符串
             real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
 
@@ -8876,8 +9656,6 @@ Cookie数量: {cookie_count}
                     logger.info(f"【{target_cookie_id}】{cookie_name}: [不存在]")
 
             # 保存真实Cookie到数据库
-            from db_manager import db_manager
-            
             # 检查是否为新账号
             existing_cookie = db_manager.get_cookie_details(target_cookie_id)
             if existing_cookie:
@@ -10633,19 +11411,36 @@ Cookie数量: {cookie_count}
                             
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 🔍 简化消息解析: sid={simple_sid}, session_id={session_id_str}')
                             
+                            log_prefix = f'[{msg_time}] 【{self.cookie_id}】[{msg_id}]'
+                            sid_lookup_minutes = 5
                             sid_lookup = self._lookup_delivery_order_by_sid(
                                 simple_sid,
-                                minutes=10,
-                                log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}]'
+                                minutes=sid_lookup_minutes,
+                                log_prefix=log_prefix
+                            )
+                            sid_lookup = await self._refresh_sid_lookup_if_needed(
+                                simple_sid,
+                                sid_lookup,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                minutes=sid_lookup_minutes,
+                                allow_bargain_ready=True,
+                                log_prefix=log_prefix
                             )
                             recent_order = sid_lookup.get('order')
                             sid_match_type = sid_lookup.get('match_type', 'missing')
                             
-                            if recent_order and sid_match_type == 'pending_ship':
+                            if recent_order and sid_match_type in {'pending_ship', 'bargain_ready'}:
                                 order_id = recent_order.get('order_id')
                                 real_item_id = recent_order.get('item_id')
                                 simple_user_id = recent_order.get('buyer_id', user_id)  # 从订单中获取buyer_id
                                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 通过sid从数据库找到订单: order_id={order_id}, item_id={real_item_id}, buyer_id={simple_user_id}')
+
+                                if sid_match_type == 'bargain_ready':
+                                    logger.info(
+                                        f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 小刀订单缺少完整待发货卡片，'
+                                        f'使用sid+小刀成功证据兜底进入自动发货: order_id={order_id}'
+                                    )
                                 
                                 # 【防重复检查】先检查该订单是否已经在冷却期内（说明完整消息已经处理过）
                                 if not self.can_auto_delivery(order_id):
@@ -10746,28 +11541,34 @@ Cookie数量: {cookie_count}
 
 
 
-            # 判断消息方向
-            # 注意：系统交易消息有时 senderUserId 也会是自己，不能直接按“手动发出”提前结束
-            message_direction = message_1.get('7', 0) if isinstance(message_1, dict) else 0
-            content_type = 0
-            is_system_biz = False
-            try:
-                message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
-                if isinstance(message_6, dict):
-                    message_6_3 = message_6.get('3', {})
-                    if isinstance(message_6_3, dict):
-                        content_type = message_6_3.get('4', 0)
-            except Exception:
-                pass
+            message_route_info = self._classify_message_route(
+                message=message,
+                message_1=message_1,
+                message_10=message_10,
+                send_message=send_message,
+            )
+            message_route = message_route_info.get('route', 'user_chat')
+            order_status_signal = message_route_info.get('order_status_signal')
+            should_notify_message = bool(message_route_info.get('should_notify'))
+            allow_auto_reply = bool(message_route_info.get('allow_auto_reply'))
+            is_system_message = bool(message_route_info.get('is_system_message'))
+            is_group_message = bool(message_route_info.get('is_group_message'))
+            message_direction = message_route_info.get('message_direction', 0)
+            content_type = message_route_info.get('content_type', 0)
+            card_title = str(message_route_info.get('card_title') or '').strip()
+            special_flow_card_titles = {
+                '我已小刀，待刀成',
+                '我已小刀,待刀成',
+                '我已成功小刀，待发货',
+                '我已成功小刀,待发货',
+            }
 
-            try:
-                biz_tag = message_10.get("bizTag", "") if isinstance(message_10, dict) else ""
-                if biz_tag and ('SECURITY' in biz_tag or 'taskName' in biz_tag or 'taskId' in biz_tag):
-                    is_system_biz = True
-            except Exception:
-                pass
-
-            is_system_message = message_direction == 1 or content_type == 6 or is_system_biz
+            logger.info(
+                f"【{self.cookie_id}】[{msg_id}] 消息分类: route={message_route}, "
+                f"status_signal={order_status_signal or 'none'}, notify={should_notify_message}, "
+                f"auto_reply={allow_auto_reply}, system={is_system_message}, "
+                f"direction={message_direction}, contentType={content_type}"
+            )
 
             if send_user_id == self.myid and not is_system_message:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】[{msg_id}] 【手动发出】 商品({item_id}): {send_message}")
@@ -10963,15 +11764,16 @@ Cookie数量: {cookie_count}
                                         logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（等待账号重新确认）")
                                         return
 
-                # 🔔 立即发送消息通知（独立于自动回复功能）
-                # 检查是否为群组消息，如果是群组消息则跳过通知
                 try:
-                    session_type = message_10.get("sessionType", "1")  # 默认为个人消息类型
-                    if session_type == "30":
+                    if is_group_message:
                         logger.info(f"📱 检测到群组消息（sessionType=30），跳过消息通知")
-                    else:
-                        # 只对个人消息发送通知
+                    elif should_notify_message:
                         await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    else:
+                        logger.info(
+                            f"📱 当前消息不发送通知: route={message_route}, "
+                            f"status_signal={order_status_signal or 'none'}, message={send_message}"
+                        )
                 except Exception as notify_error:
                     logger.error(f"📱 发送消息通知失败: {self._safe_str(notify_error)}")
 
@@ -11027,48 +11829,39 @@ Cookie数量: {cookie_count}
                 except Exception as e:
                     logger.error(f"订单状态处理失败: {self._safe_str(e)}")
 
-            # 交易成功消息到达时强制刷新一次订单详情，避免缓存导致状态未及时落库
-            if order_id and send_message in ['[买家确认收货，交易成功]', '[你已确认收货，交易成功]']:
+            # 关键状态消息到达时，按需补刷一次订单详情，避免缓存把状态留在旧值
+            if order_id and order_status_signal in {'pending_ship', 'shipped', 'completed', 'cancelled', 'refunding'}:
                 try:
                     refresh_sid = ''
                     if isinstance(message_1, dict):
                         refresh_sid = message_1.get("2", "")
-                    logger.info(
-                        f"【{self.cookie_id}】[{msg_id}] 检测到交易成功系统消息，开始强制刷新订单详情: "
-                        f"order_id={order_id}, sid={refresh_sid}"
-                    )
-                    await self.fetch_order_detail_info(
+
+                    await self._maybe_force_refresh_order_detail_for_signal(
                         order_id=order_id,
                         item_id=item_id,
                         buyer_id=send_user_id,
                         sid=refresh_sid,
                         buyer_nick=send_user_name,
-                        force_refresh=True
+                        status_signal=order_status_signal,
+                        reason=f'message_signal_{order_status_signal}',
+                        delay_seconds=1 if order_status_signal == 'pending_ship' else 0,
+                        log_prefix=f"【{self.cookie_id}】[{msg_id}]"
                     )
                 except Exception as refresh_e:
                     logger.error(
-                        f"【{self.cookie_id}】[{msg_id}] 交易成功后强制刷新订单详情失败: {self._safe_str(refresh_e)}"
+                        f"【{self.cookie_id}】[{msg_id}] 状态消息触发订单详情补刷失败: {self._safe_str(refresh_e)}"
                     )
 
             # 【优先处理】检查系统消息和自动发货触发消息（不受人工接入暂停影响）
-            ignore_keywords = [
+            fallback_ignore_keywords = [
                 '不想宝贝被砍价',
                 'AI正在帮你回复',
-                '发来一条',              # 匹配 '发来一条消息' 和 '发来一条新消息'
-                '确认收货，交易成功',     # 匹配 '[买家确认收货，交易成功]' 和 '[你已确认收货，交易成功]'
-                '闲鱼小红花',            # 匹配 '卖家人不错？送Ta闲鱼小红花' 和 '你人真不错，送你闲鱼小红花'
-                '你已发货',              # 匹配 '[你已发货]' 和 '你已发货'，避免误匹配买家消息如"你已发货了吗"
+                '发来一条',
                 '小心假客服骗钱',
-                '「我将「退货退款」修改为「退款」」',
-                '订单已签收',
                 '蚂蚁森林能量',
-                '订单即将自动确认收货',
-                '我完成了评价',
-                '创建合约',
                 '恭喜你拿到曝光卡',
-                '退款成功，钱款已原路退返',
-                '宝贝性价比如何，去表个态吧',
-                '温馨提醒'              # 匹配 '温馨提醒：商品信息近期有过变更，请与买家沟通一致，防止误拍引起纠纷'，以及其他买家/卖家可能的自动回复消息
+                '订单即将自动确认收货',
+                '温馨提醒：商品信息近期有过变更',
             ]
             if send_message == '[我已拍下，待付款]':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 系统消息不处理')
@@ -11087,26 +11880,17 @@ Cookie数量: {cookie_count}
                 await self.handle_auto_comment(message, msg_time, msg_id)
                 logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（评价提醒消息）")
                 return
-            elif any(keyword in send_message for keyword in ignore_keywords):
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ⏹️ 系统消息不处理: {send_message}')
+            elif message_route == 'system_notice' or any(keyword in send_message for keyword in fallback_ignore_keywords):
+                logger.info(
+                    f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ⏹️ 系统提示消息不处理: '
+                    f'route={message_route}, message={send_message}'
+                )
                 return
             # 简化消息通过 sid 查找订单，更可靠
-            elif self._is_auto_delivery_trigger(send_message):
+            elif message_route == 'order_status' and self._is_auto_delivery_trigger(send_message):
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 检测到自动发货触发消息: {send_message}')
 
                 # 只允许系统消息触发自动发货，防止买家手动输入关键字触发
-                message_direction = message_1.get('7', 0) if isinstance(message_1, dict) else 0
-                content_type = 0
-                try:
-                    message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
-                    if isinstance(message_6, dict):
-                        message_6_3 = message_6.get('3', {})
-                        if isinstance(message_6_3, dict):
-                            content_type = message_6_3.get('4', 0)
-                except Exception:
-                    pass
-
-                is_system_message = message_direction == 1 or content_type == 6
                 if not is_system_message:
                     logger.warning(
                         f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ⚠️ 自动发货关键字来自非系统消息，已忽略 '
@@ -11126,13 +11910,13 @@ Cookie数量: {cookie_count}
                 logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（自动发货完成）")
                 return
             # 【重要】检查小刀流程卡片消息 - 即使在人工接入暂停期间也要处理
-            elif send_message == '[卡片消息]':
+            elif send_message == '[卡片消息]' or card_title in special_flow_card_titles:
                 # 检查是否为小刀相关卡片消息
                 try:
                     # 从消息中提取卡片内容
-                    card_title = None
+                    card_title = card_title or None
                     card_message_1 = message.get("1", {}) if isinstance(message, dict) else {}
-                    if isinstance(card_message_1, dict):
+                    if not card_title and isinstance(card_message_1, dict):
                         if "6" in card_message_1 and isinstance(card_message_1["6"], dict):
                             message_6 = card_message_1["6"]
                             if "3" in message_6 and isinstance(message_6["3"], dict):
@@ -11211,12 +11995,27 @@ Cookie数量: {cookie_count}
                             logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，无法执行免拼发货')
                             return
 
+                        self._mark_order_bargain_flow(
+                            order_id,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
+                            context=card_title or 'waiting_bargain',
+                        )
+
                         # 延迟2秒后执行免拼发货
                         logger.info(f'[{msg_time}] 【{self.cookie_id}】延迟2秒后执行免拼发货...')
                         await asyncio.sleep(2)
                         # 调用自动免拼发货方法
                         result = await self.auto_freeshipping(order_id, item_id, send_user_id)
                         if result.get('success'):
+                            self._mark_order_bargain_flow(
+                                order_id,
+                                item_id=item_id,
+                                buyer_id=send_user_id,
+                                apply_configured_price=True,
+                                success_detected=True,
+                                context=f'{card_title or "waiting_bargain"}_success',
+                            )
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 自动免拼发货成功')
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】⏳ 已完成免拼，等待"我已成功小刀，待发货"卡片后再自动发货')
                             return
@@ -11228,6 +12027,17 @@ Cookie数量: {cookie_count}
                     # 第二阶段：成功小刀待发货，触发自动发货
                     elif card_title in ready_to_ship_titles:
                         logger.info(f'[{msg_time}] 【{self.cookie_id}】【系统】检测到"{card_title}"，开始自动发货')
+
+                        order_id = self._extract_order_id(message, message_data)
+                        if order_id:
+                            self._mark_order_bargain_flow(
+                                order_id,
+                                item_id=item_id,
+                                buyer_id=send_user_id,
+                                apply_configured_price=True,
+                                success_detected=True,
+                                context=card_title,
+                            )
 
                         # 检查是否启用自动确认发货
                         if not self.is_auto_confirm_enabled():
@@ -11263,6 +12073,13 @@ Cookie数量: {cookie_count}
                         db_manager.update_buyer_nick_by_buyer_id(send_user_id, valid_buyer_nick, self.cookie_id)
                     except Exception as e:
                         logger.debug(f"更新买家昵称失败: {self._safe_str(e)}")
+
+            if not allow_auto_reply:
+                logger.info(
+                    f"【{self.cookie_id}】[{msg_id}] ⏹️ 当前消息不进入自动回复链: "
+                    f"route={message_route}, status_signal={order_status_signal or 'none'}"
+                )
+                return
 
             # 使用防抖机制处理聊天消息回复
             # 如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
@@ -11904,6 +12721,26 @@ Cookie数量: {cookie_count}
             "total_saved": total_saved,
             "items": all_items
         }
+
+    def _get_item_polish_module(self):
+        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
+            from item_polish_module import ItemPolishModule
+        else:
+            from secure_item_polish_ultra import ItemPolishModule
+
+        return ItemPolishModule(self)
+
+    async def polish_item(self, item_id, retry_count=0):
+        """擦亮单个商品。"""
+        return await self._get_item_polish_module().polish_item(item_id, retry_count)
+
+    async def _polish_item_backup(self, item_id):
+        """使用备用API擦亮商品。"""
+        return await self._get_item_polish_module()._polish_item_backup(item_id)
+
+    async def polish_all_items(self):
+        """擦亮所有在售商品。"""
+        return await self._get_item_polish_module().polish_all_items()
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""

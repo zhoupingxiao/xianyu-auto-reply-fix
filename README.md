@@ -6,12 +6,6 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
 [![Usage](https://img.shields.io/badge/Usage-仅供学习-red.svg)](#️-版权声明与使用条款)
 
-## 原始项目
-
->https://github.com/zhinianboke-new/xianyu-auto-reply
-
-本项目基于以上项目二开
-
 ## 📋 项目概述
 
 一个功能完整的闲鱼管理系统，采用现代化的技术架构，支持多用户、多账号管理，具备智能回复、自动发货、自动确认发货、商品管理等企业级功能。系统基于Python异步编程，使用FastAPI提供RESTful API，SQLite数据库存储，支持Docker一键部署。
@@ -52,6 +46,8 @@
 - **独立运行** - 每个账号独立启用、停用和刷新
 - **实时状态** - 账号连接状态和运行配置可实时查看
 - **账号维护** - 支持 Cookie、账密、备注等信息管理
+- **一键擦亮** - 支持在账号列表中一键批量擦亮当前在售商品
+- **定时擦亮** - 支持按账号配置每日执行时段与随机延迟，自动完成商品擦亮
 
 ### 🤖 智能回复系统
 - **关键词匹配** - 支持通用关键词和商品专属关键词回复
@@ -76,11 +72,8 @@
 - **多规格配置** - 支持多规格商品配置和管理
 - **智能去重** - 自动去重，避免重复存储
 
-### 🔍 商品搜索功能
-- **真实数据获取** - 基于 Playwright 获取真实闲鱼商品数据
-- **智能排序** - 按"人想要"数量自动倒序排列
-- **多页搜索** - 支持一次性获取多页商品数据
-- **前端分页** - 支持灵活的前端分页显示
+### 🧰 运营协同
+- **后台运营** - 提供订单管理、通知渠道、消息通知和在线客服等常用功能，便于统一处理日常运营事务
 
 ### 📊 系统监控
 - **实时日志** - 完整的操作日志记录、查看和导出
@@ -97,107 +90,6 @@
 - **发货规则管理** - 支持多规格发货规则的创建和管理
 - **数据备份恢复** - 支持用户备份恢复和管理员数据库备份
 - **容器化部署** - 支持 Docker / Docker Compose 持久化部署
-
-## 📁 项目结构
-
-<details>
-<summary>点击展开查看详细项目结构</summary>
-
-```
-xianyu-auto-reply-fix/
-├── 📄 核心文件
-│   ├── Start.py                        # 项目启动入口，初始化所有服务
-│   ├── XianyuAutoAsync.py              # 闲鱼WebSocket连接和消息处理核心
-│   ├── reply_server.py                 # FastAPI Web服务器和完整API接口
-│   ├── db_manager.py                   # SQLite数据库管理，支持多用户数据隔离
-│   ├── cookie_manager.py               # 多账号Cookie管理和任务调度
-│   ├── ai_reply_engine.py              # AI智能回复引擎，支持多种AI模型
-│   ├── order_status_handler.py         # 订单状态处理和更新模块
-│   ├── order_event_hub.py              # 订单事件中心，统一事件分发
-│   ├── file_log_collector.py           # 实时日志收集和管理系统
-│   ├── config.py                       # 全局配置文件管理器
-│   ├── api_captcha_remote.py           # 远程验证码API服务
-│   ├── auto_updater.py                 # 自动更新模块
-│   ├── generate_update_manifest.py     # 更新清单生成工具
-│   ├── secure_confirm_ultra.py         # 自动确认发货模块（多层加密保护）
-│   ├── secure_confirm_decrypted.py     # 自动确认发货模块（解密版本）
-│   ├── secure_freeshipping_ultra.py    # 自动免拼发货模块（多层加密保护）
-│   ├── secure_freeshipping_decrypted.py # 自动免拼发货模块（解密版本）
-│   ├── captcha_control.html            # 验证码控制页面
-│   ├── start.sh                        # 启动脚本（Linux/macOS）
-│   ├── stop.sh                         # 停止脚本（Linux/macOS）
-│   ├── debug-xvfb.sh                   # Xvfb调试脚本
-│   └── update_files.json               # 更新文件清单
-├── 🛠️ 工具模块
-│   └── utils/
-│       ├── xianyu_utils.py             # 闲鱼API工具函数（加密、签名、解析）
-│       ├── message_utils.py            # 消息格式化和处理工具
-│       ├── ws_utils.py                 # WebSocket客户端封装
-│       ├── image_utils.py              # 图片处理工具（压缩、格式转换）
-│       ├── image_uploader.py           # 图片上传到闲鱼CDN
-│       ├── item_search.py              # 商品搜索功能（基于Playwright，无头模式）
-│       ├── order_detail_fetcher.py     # 订单详情获取工具
-│       ├── qr_login.py                 # 二维码登录功能
-│       ├── refresh_util.py             # Cookie刷新工具，自动检测和刷新过期Cookie
-│       ├── captcha_remote_control.py   # 远程验证码控制模块
-│       ├── xianyu_slider_stealth.py    # 滑块验证模块（反检测技术）
-│       └── slider_patch.py             # 滑块验证补丁模块
-├── 🌐 前端界面
-│   └── static/
-│       ├── index.html                  # 主管理界面（集成所有功能模块）
-│       ├── login.html                  # 用户登录页面
-│       ├── register.html               # 用户注册页面（邮箱验证）
-│       ├── favicon.png                 # 网站图标
-│       ├── version.txt                 # 版本号文件
-│       ├── update_log.txt              # 更新日志
-│       ├── xianyu_js_version_2.js      # 闲鱼JavaScript工具库
-│       ├── js/
-│       │   └── app.js                  # 主要JavaScript逻辑和所有功能模块
-│       ├── css/
-│       │   ├── variables.css           # CSS变量定义
-│       │   ├── layout.css              # 布局样式
-│       │   ├── components.css          # 组件样式
-│       │   ├── accounts.css            # 账号管理样式
-│       │   ├── keywords.css            # 关键词管理样式
-│       │   ├── items.css               # 商品管理样式
-│       │   ├── logs.css                # 日志管理样式
-│       │   ├── notifications.css       # 通知样式
-│       │   ├── dashboard.css           # 仪表板样式
-│       │   ├── admin.css               # 管理员样式
-│       │   └── app.css                 # 主应用样式
-│       ├── lib/
-│       │   ├── bootstrap/              # Bootstrap框架
-│       │   └── bootstrap-icons/        # Bootstrap图标
-│       └── userscripts/
-│           └── goofish-dark-mode.user.js # 闲鱼聊天暗色模式油猴脚本
-├── 🐳 Docker部署
-│   ├── Dockerfile                      # Docker镜像构建文件（优化版）
-│   ├── Dockerfile-cn                   # 国内优化版Docker镜像构建文件
-│   ├── docker-compose.yml              # Docker Compose一键部署配置
-│   ├── docker-compose-cn.yml           # 国内优化版Docker Compose配置
-│   ├── docker-deploy.sh                # Docker部署管理脚本（Linux/macOS）
-│   ├── docker-deploy.bat               # Docker部署管理脚本（Windows）
-│   ├── build-multi-arch.sh             # 多架构镜像构建脚本
-│   ├── entrypoint.sh                   # Docker容器启动脚本
-│   └── .dockerignore                   # Docker构建忽略文件
-├── 🌐 Nginx配置
-│   └── nginx/
-│       └── nginx.conf                  # Nginx反向代理配置
-├── 📋 配置与文档
-│   ├── global_config.yml               # 全局配置文件（WebSocket、API等）
-│   ├── requirements.txt                # Python依赖包列表
-│   ├── .gitignore                      # Git忽略文件配置
-│   ├── .gitattributes                  # Git属性配置
-│   └── README.md                       # 项目说明文档（本文件）
-└── 📊 数据目录（运行时创建）
-    ├── data/                           # 数据目录（Docker挂载，自动创建）
-    │   ├── xianyu_data.db              # SQLite主数据库文件
-    │   └── xianyu_data_backup_*.db     # 数据库备份文件
-    ├── logs/                           # 按日期分割的日志文件
-    └── backups/                        # 其他备份文件
-```
-
-</details>
 
 ## 🚀 快速开始
 
@@ -298,10 +190,6 @@ python Start.py
 # http://localhost:8090
 ```
 
-> 默认管理员账号：`admin`  
-> 默认密码：`admin123`  
-> 首次登录后请尽快修改密码。
-
 > 本地运行请确保已安装 Node.js，否则 `PyExecJS` 相关功能无法正常使用。
 
 ### 📋 环境要求
@@ -359,8 +247,7 @@ ENABLE_VNC=false
 DISPLAY=:99
 ```
 
-> 其他运行参数（如 WebSocket、心跳、自动回复等）主要在 `global_config.yml` 和 Web 管理界面中配置。  
-> 管理员默认账号为 `admin`，默认密码为 `admin123`，建议首次登录后立即修改。
+> 其他运行参数（如 WebSocket、心跳、自动回复等）主要在 `global_config.yml` 和 Web 管理界面中配置。
 
 ### 🔄 热更新发版
 
@@ -370,7 +257,7 @@ DISPLAY=:99
 - 任意目录下的 `.py` 文件
 - 任意目录下的 `.html` 文件
 - `static/` 目录下的静态资源，例如 `.js`、`.css`、`.txt`、`.json`、图片和字体文件
-- `static/` 和 `frontend/` 目录下的前端源码文件，例如 `.ts`、`.tsx`、`.jsx`、`.vue`
+- `static/` 目录下的前端源码文件，例如 `.ts`、`.tsx`、`.jsx`、`.vue`
 
 默认排除的内容：
 - 用户配置和运行时目录，例如 `global_config.yml`、`data/`、`logs/`、`browser_data/`、`update_backup/`、`venv/`
@@ -396,7 +283,7 @@ DISPLAY=:99
   - Docker Compose 默认配置: http://localhost:9000
   - Docker Compose 国内配置: http://localhost:8000
   - 本地运行: http://localhost:8090
-- **默认管理员账号**：
+- **默认管理员账号（首次初始化且未自定义密码时）**：
   - 用户名：`admin`
   - 密码：`admin123`
 - **API文档**：
@@ -414,9 +301,9 @@ DISPLAY=:99
 ## 📋 系统使用
 
 ### 1. 用户注册
-- 访问登录页或注册页（如本地运行使用 `http://localhost:8090/register.html`）
+- 若系统已开启注册功能，可访问登录页或注册页（如本地运行使用 `http://localhost:8090/register.html`）
 - 填写用户信息，完成邮箱验证
-- 输入图形验证码完成注册
+- 根据系统配置完成图形验证码校验
 
 ### 2. 添加闲鱼账号
 - 登录系统后进入主界面
@@ -425,23 +312,20 @@ DISPLAY=:99
 - 可按需配置用户名、密码、备注和显示浏览器
 - 保存后即可启用或刷新账号
 
-### 3. 配置自动回复
+### 3. 使用商品擦亮
+- 在账号管理页可直接执行一键擦亮，批量处理当前账号在售商品
+- 可按账号配置每日定时擦亮任务，支持执行时段和随机延迟
+
+### 4. 配置自动回复
 - **关键词回复**：设置通用关键词和商品专属关键词
 - **AI回复**：配置兼容模型接口启用智能回复
 - **默认回复**：设置未匹配时的默认回复
 - **指定商品回复**：为特定商品设置专门回复内容
 
-### 4. 设置自动发货
+### 5. 设置自动发货
 - 添加卡券和发货规则，配置商品与发货内容的匹配关系
 - 支持文本、批量数据、API、图片等发货方式
 - 系统检测到付款消息或小刀卡片后自动触发发货流程
-
-### 5. 使用商品搜索功能
-- 登录后进入商品搜索页面
-- 输入搜索关键词和查询页数
-- 系统自动获取真实闲鱼商品数据
-- 商品按“人想要”数量自动排序
-- 支持查看商品详情和导出搜索结果
 
 ### 6. 安装闲鱼聊天暗色模式脚本（可选）
 本项目提供了一个油猴用户脚本，可为闲鱼官网聊天页面添加暗色模式支持。
@@ -489,8 +373,6 @@ DISPLAY=:99
 ## ⚙️ 配置说明
 
 ### 全局配置文件
-> 默认管理员账号为 `admin`，默认密码为 `admin123`，首次登录后请立即修改。
-
 `global_config.yml` 包含详细的系统配置，支持：
 - WebSocket连接参数
 - API接口配置
@@ -576,10 +458,10 @@ docker-deploy.bat
 
 本项目参考了以下开源项目：
 
-- **[XianYuApis](https://github.com/cv-cat/XianYuApis)** - 提供了闲鱼API接口的技术参考
+- **[xianyu-auto-reply](https://github.com/zhinianboke-new/xianyu-auto-reply)** - 提供了原始项目基础与二次开发起点
+- **[XianYuApis](https://github.com/cv-cat/XianYuApis)** - 提供了闲鱼 API 接口的技术参考
 - **[XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent)** - 提供了自动化处理的实现思路
 - **[myfish](https://github.com/Kaguya233qwq/myfish)** - 提供了扫码登录的实现思路
-
 
 感谢这些优秀的开源项目为本项目的开发提供了宝贵的参考和启发！
 

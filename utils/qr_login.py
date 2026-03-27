@@ -16,6 +16,9 @@ import qrcode
 import qrcode.constants
 from loguru import logger
 import hashlib
+from urllib.parse import urlparse
+
+from utils.image_utils import image_manager
 
 
 def generate_headers():
@@ -60,6 +63,9 @@ class QRLoginSession:
         self.expire_time = 300  # 5分钟过期
         self.params = {}  # 存储登录参数
         self.verification_url = None  # 风控验证URL
+        self.screenshot_path = None  # 风控验证截图
+        self.verification_task = None  # 风控验证页面保持任务
+        self.success_source = None  # 登录成功来源: api/browser
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -98,6 +104,281 @@ class QRLoginManager:
     def _cookie_marshal(self, cookies: dict) -> str:
         """将Cookie字典转换为字符串"""
         return "; ".join([f"{k}={v}" for k, v in cookies.items()])
+
+    def _build_browser_cookies(self, target_url: str, cookies: Dict[str, str]) -> list[Dict[str, Any]]:
+        """将API会话中的Cookie转换为Playwright可用格式"""
+        browser_cookies = []
+        parsed = urlparse(target_url or self.host)
+        target_origin = f"{parsed.scheme or 'https'}://{parsed.netloc or 'passport.goofish.com'}"
+
+        for name, value in (cookies or {}).items():
+            if not name or value is None:
+                continue
+            browser_cookies.append({
+                'name': name,
+                'value': str(value),
+                'url': target_origin,
+                'path': '/',
+            })
+
+        return browser_cookies
+
+    def _normalize_cookie_dict(self, cookies: Any) -> Dict[str, str]:
+        """将不同形式的Cookie数据统一转换为字典"""
+        if isinstance(cookies, dict) or hasattr(cookies, 'items'):
+            return {
+                str(name): str(value)
+                for name, value in cookies.items()
+                if name and value is not None
+            }
+
+        normalized = {}
+        for cookie in cookies or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = cookie.get('name')
+            value = cookie.get('value')
+            if name and value is not None:
+                normalized[str(name)] = str(value)
+        return normalized
+
+    def _merge_session_cookies(self, session: QRLoginSession, cookies: Any):
+        """合并Cookie到会话中"""
+        cookie_dict = self._normalize_cookie_dict(cookies)
+        if not cookie_dict:
+            return
+
+        session.cookies.update(cookie_dict)
+        if cookie_dict.get('unb'):
+            session.unb = cookie_dict['unb']
+
+    def _has_completed_login_cookies(self, cookie_dict: Dict[str, str]) -> bool:
+        """基于关键Cookie判断是否已经完成登录"""
+        if not cookie_dict.get('unb'):
+            return False
+
+        companion_keys = ('cookie2', 'havana_lgc2_77', '_tb_token_', 'sgcookie')
+        return any(cookie_dict.get(key) for key in companion_keys)
+
+    def _is_logged_in_url(self, url: str) -> bool:
+        """判断URL是否已经跳转到登录后的页面"""
+        current_url = str(url or '')
+        if not current_url:
+            return False
+
+        if 'www.goofish.com/im' in current_url:
+            return True
+
+        return (
+            'goofish.com' in current_url and
+            'passport.goofish.com' not in current_url and
+            'mini_login' not in current_url and
+            '/iv/' not in current_url
+        )
+
+    def _mark_session_success(
+        self,
+        session: QRLoginSession,
+        cookies: Any,
+        source: str,
+        require_complete_cookies: bool = False
+    ) -> bool:
+        """统一的会话成功收口，避免多条链路重复覆盖状态"""
+        if not session:
+            return False
+
+        self._merge_session_cookies(session, cookies)
+
+        has_success_cookie = bool(session.cookies.get('unb'))
+        has_complete_cookies = self._has_completed_login_cookies(session.cookies)
+        if not has_success_cookie:
+            return False
+        if require_complete_cookies and not has_complete_cookies:
+            return False
+
+        was_success = session.status == 'success'
+        session.status = 'success'
+        session.success_source = session.success_source or source
+
+        if not was_success:
+            logger.info(
+                f"扫码登录成功（来源: {source}）: {session.session_id}, "
+                f"UNB: {session.unb}"
+            )
+
+        return True
+
+    async def _context_cookie_dict(self, context) -> Dict[str, str]:
+        """提取浏览器上下文中的Cookie字典"""
+        cookies = await context.cookies()
+        return self._normalize_cookie_dict(cookies)
+
+    async def _probe_browser_login_success(self, session: QRLoginSession, page, context) -> bool:
+        """在浏览器侧兜底判断验证是否已经完成"""
+        current_url = page.url
+        cookie_dict = await self._context_cookie_dict(context)
+        cookies_ready = self._has_completed_login_cookies(cookie_dict)
+        url_ready = self._is_logged_in_url(current_url)
+
+        if cookies_ready and url_ready:
+            logger.info(
+                f"扫码登录浏览器侧检测成功（当前页）: {session.session_id}, URL: {current_url}"
+            )
+            return self._mark_session_success(session, cookie_dict, 'browser', require_complete_cookies=True)
+
+        if not cookies_ready:
+            return False
+
+        probe_page = None
+        try:
+            probe_page = await context.new_page()
+            await probe_page.goto('https://www.goofish.com/im', wait_until='domcontentloaded', timeout=30000)
+            await probe_page.wait_for_timeout(1500)
+
+            probe_url = probe_page.url
+            probe_cookie_dict = await self._context_cookie_dict(context)
+            im_root = await probe_page.query_selector('.rc-virtual-list-holder-inner')
+            has_im_root = im_root is not None
+
+            if self._is_logged_in_url(probe_url):
+                logger.info(
+                    f"扫码登录浏览器侧探测成功: {session.session_id}, "
+                    f"probe_url: {probe_url}, has_im_root: {has_im_root}"
+                )
+                return self._mark_session_success(session, probe_cookie_dict, 'browser', require_complete_cookies=True)
+        except Exception as e:
+            logger.debug(f"扫码登录浏览器侧探测未确认成功: {session.session_id}, 错误: {e}")
+        finally:
+            if probe_page:
+                try:
+                    await probe_page.close()
+                except Exception:
+                    pass
+
+        return False
+
+    async def _launch_verification_page(self, session_id: str):
+        """在服务端打开验证页面并截取二维码，保持原始会话存活"""
+        session = self.sessions.get(session_id)
+        if not session or not session.verification_url:
+            return
+
+        playwright = None
+        browser = None
+        context = None
+        page = None
+
+        try:
+            from playwright.async_api import async_playwright
+
+            logger.info(f"开始打开扫码登录验证页面: {session_id}")
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--lang=zh-CN',
+                ]
+            )
+            context = await browser.new_context(
+                viewport={'width': 540, 'height': 960},
+                locale='zh-CN',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True,
+                extra_http_headers={
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                }
+            )
+
+            browser_cookies = self._build_browser_cookies(session.verification_url, session.cookies)
+            if browser_cookies:
+                await context.add_cookies(browser_cookies)
+
+            page = await context.new_page()
+            await page.goto(session.verification_url, wait_until='domcontentloaded', timeout=60000)
+            await page.wait_for_timeout(2500)
+
+            screenshot_bytes = await page.screenshot(full_page=True)
+            if screenshot_bytes:
+                screenshot_path = image_manager.save_image(screenshot_bytes)
+                if screenshot_path:
+                    if session.screenshot_path and session.screenshot_path != screenshot_path:
+                        image_manager.delete_image(session.screenshot_path)
+                    session.screenshot_path = screenshot_path
+                    logger.info(f"扫码登录验证截图已保存: {session_id}, 路径: {screenshot_path}")
+                else:
+                    logger.warning(f"扫码登录验证截图保存失败: {session_id}")
+            else:
+                logger.warning(f"扫码登录验证截图为空: {session_id}")
+
+            while True:
+                current_session = self.sessions.get(session_id)
+                if not current_session:
+                    break
+                if current_session.status == 'success':
+                    logger.info(f"扫码登录验证页检测到会话已成功: {session_id}")
+                    break
+                if current_session.status not in {'verification_required', 'scanned', 'waiting', 'processing'}:
+                    break
+
+                if await self._probe_browser_login_success(current_session, page, context):
+                    break
+
+                await page.wait_for_timeout(3000)
+
+        except asyncio.CancelledError:
+            logger.info(f"扫码登录验证页面任务已取消: {session_id}")
+            raise
+        except Exception as e:
+            logger.error(f"打开扫码登录验证页面失败: {session_id}, 错误: {e}")
+        finally:
+            try:
+                if page:
+                    await page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    await context.close()
+            except Exception:
+                pass
+            try:
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
+            try:
+                if playwright:
+                    await playwright.stop()
+            except Exception:
+                pass
+
+            latest_session = self.sessions.get(session_id)
+            if latest_session:
+                latest_session.verification_task = None
+
+            logger.info(f"扫码登录验证页面已关闭: {session_id}")
+
+    def _ensure_verification_task(self, session: QRLoginSession):
+        """确保风控验证页面任务只启动一次"""
+        task = session.verification_task
+        if task and not task.done():
+            return
+        session.verification_task = asyncio.create_task(self._launch_verification_page(session.session_id))
+
+    def _cleanup_session_assets(self, session: QRLoginSession):
+        """清理会话关联的截图和后台任务"""
+        task = session.verification_task
+        if task and not task.done():
+            task.cancel()
+        session.verification_task = None
+
+        if session.screenshot_path:
+            image_manager.delete_image(session.screenshot_path)
+            session.screenshot_path = None
 
     async def _get_mh5tk(self, session: QRLoginSession) -> dict:
         """获取m_h5_tk和m_h5_tk_enc"""
@@ -320,9 +601,15 @@ class QRLoginManager:
                     # 检查会话是否还存在
                     if session_id not in self.sessions:
                         break
+                    if session.status == 'success':
+                        logger.info(f"扫码登录API轮询检测到会话已成功: {session_id}")
+                        break
 
                     # 轮询二维码状态
                     resp = await self._poll_qrcode_status(session)
+                    if session.status == 'success':
+                        logger.info(f"扫码登录API轮询响应返回前，会话已由其他链路成功: {session_id}")
+                        break
                     qrcode_status = (
                         resp.json()
                         .get("content", {})
@@ -348,20 +635,17 @@ class QRLoginManager:
                                 .get("iframeRedirectUrl")
                             )
                             session.verification_url = iframe_url
+                            session.expire_time = max(session.expire_time, 600)
+                            self._merge_session_cookies(session, resp.cookies)
+                            self._ensure_verification_task(session)
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
-                            break
+                            await asyncio.sleep(0.8)
+                            continue
                         else:
                             # 登录成功
-                            session.status = 'success'
-
-                            # 保存Cookie
-                            for k, v in resp.cookies.items():
-                                session.cookies[k] = v
-                                if k == 'unb':
-                                    session.unb = v
-
-                            logger.info(f"扫码登录成功: {session_id}, UNB: {session.unb}")
-                            break
+                            if self._mark_session_success(session, resp.cookies, 'api'):
+                                break
+                            logger.warning(f"扫码登录API返回成功状态，但关键Cookie不足: {session_id}")
 
                     elif qrcode_status == "NEW":
                         # 二维码未被扫描，继续轮询
@@ -369,9 +653,12 @@ class QRLoginManager:
 
                     elif qrcode_status == "EXPIRED":
                         # 二维码已过期
-                        session.status = 'expired'
-                        logger.info(f"二维码已过期: {session_id}")
-                        break
+                        if session.status == 'verification_required':
+                            logger.info(f"二维码已过期，但会话已进入验证流程，继续等待: {session_id}")
+                        else:
+                            session.status = 'expired'
+                            logger.info(f"二维码已过期: {session_id}")
+                            break
 
                     elif qrcode_status == "SCANED":
                         # 二维码已被扫描，等待确认
@@ -380,9 +667,12 @@ class QRLoginManager:
                             logger.info(f"二维码已扫描，等待确认: {session_id}")
                     else:
                         # 用户取消确认
-                        session.status = 'cancelled'
-                        logger.info(f"用户取消登录: {session_id}")
-                        break
+                        if session.status == 'verification_required':
+                            logger.info(f"扫码状态 {qrcode_status}，但验证流程仍在进行，继续等待: {session_id}")
+                        else:
+                            session.status = 'cancelled'
+                            logger.info(f"用户取消登录: {session_id}")
+                            break
 
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 
@@ -415,9 +705,10 @@ class QRLoginManager:
         }
         logger.info(f"获取会话状态: {result}")
         # 如果需要验证，返回验证URL
-        if session.status == 'verification_required' and session.verification_url:
+        if session.status == 'verification_required':
             result['verification_url'] = session.verification_url
-            result['message'] = '账号被风控，需要手机验证'
+            result['screenshot_path'] = session.screenshot_path
+            result['message'] = '账号被风控，需要扫码验证' if session.screenshot_path else '账号被风控，正在准备验证二维码'
 
         # 如果登录成功，返回Cookie信息
         if session.status == 'success' and session.cookies and session.unb:
@@ -434,6 +725,7 @@ class QRLoginManager:
                 expired_sessions.append(session_id)
 
         for session_id in expired_sessions:
+            self._cleanup_session_assets(self.sessions[session_id])
             del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")
 

@@ -212,6 +212,22 @@ class DBManager:
             logger.warning(f"检测到未映射订单状态，按原值保存: {status}")
         return mapped
 
+    def _get_order_status_priority(self, status: str) -> int:
+        normalized = self._normalize_order_status(status)
+        priority_map = {
+            'processing': 10,
+            'pending_payment': 15,
+            'pending_ship': 20,
+            'partial_success': 30,
+            'partial_pending_finalize': 30,
+            'shipped': 40,
+            'completed': 50,
+            'refunding': 60,
+            'refund_cancelled': 65,
+            'cancelled': 70,
+        }
+        return priority_map.get(normalized, 0)
+
     def resolve_external_order_status(self, current_status: str, incoming_status: str, source: str = "external_sync") -> str:
         """合并外部/旁路状态写入，避免更粗粒度状态覆盖内部进度状态。"""
         normalized_current = self._normalize_order_status(current_status)
@@ -224,6 +240,7 @@ class DBManager:
             return normalized_incoming
 
         blocked_incoming_map = {
+            'pending_payment': {'processing'},
             'pending_ship': {'processing', 'pending_payment'},
             'partial_success': {'processing', 'pending_payment', 'pending_ship', 'shipped'},
             'partial_pending_finalize': {'processing', 'pending_payment', 'pending_ship', 'shipped'},
@@ -237,6 +254,19 @@ class DBManager:
         if normalized_incoming in blocked_incoming:
             logger.warning(
                 f"忽略外部订单状态覆盖: source={source}, current={normalized_current}, incoming={normalized_incoming}"
+            )
+            return normalized_current
+
+        current_priority = self._get_order_status_priority(normalized_current)
+        incoming_priority = self._get_order_status_priority(normalized_incoming)
+        if (
+            current_priority
+            and incoming_priority
+            and incoming_priority < current_priority
+            and normalized_incoming not in {'refunding', 'cancelled', 'refund_cancelled'}
+        ):
+            logger.warning(
+                f"忽略低优先级外部状态覆盖: source={source}, current={normalized_current}, incoming={normalized_incoming}"
             )
             return normalized_current
 
@@ -427,6 +457,8 @@ class DBManager:
                 spec_value_2 TEXT,
                 quantity TEXT,
                 amount TEXT,
+                bargain_flow_detected INTEGER DEFAULT 0,
+                bargain_success_detected INTEGER DEFAULT 0,
                 order_status TEXT DEFAULT 'unknown',
                 pre_refund_status TEXT,
                 cookie_id TEXT,
@@ -462,6 +494,22 @@ class DBManager:
                 logger.info("正在为 orders 表添加 pre_refund_status 列...")
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN pre_refund_status TEXT")
                 logger.info("orders 表 pre_refund_status 列添加完成")
+
+            # 检查并添加 bargain_flow_detected 列（用于记录小刀/拼团成交价覆盖）
+            try:
+                self._execute_sql(cursor, "SELECT bargain_flow_detected FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 bargain_flow_detected 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN bargain_flow_detected INTEGER DEFAULT 0")
+                logger.info("orders 表 bargain_flow_detected 列添加完成")
+
+            # 检查并添加 bargain_success_detected 列（用于记录小刀已进入第二阶段的成功证据）
+            try:
+                self._execute_sql(cursor, "SELECT bargain_success_detected FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 bargain_success_detected 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN bargain_success_detected INTEGER DEFAULT 0")
+                logger.info("orders 表 bargain_success_detected 列添加完成")
 
             # 检查并添加 user_id 列（用于数据库迁移）
             try:
@@ -744,6 +792,27 @@ class DBManager:
                 template TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            # 创建定时任务表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                task_type TEXT NOT NULL DEFAULT 'item_polish',
+                account_id TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                interval_hours INTEGER DEFAULT 24,
+                delay_minutes INTEGER DEFAULT 0,
+                random_delay_max INTEGER DEFAULT 10,
+                next_run_at TEXT,
+                last_run_at TEXT,
+                last_run_result TEXT,
+                user_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (account_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
 
@@ -6509,7 +6578,8 @@ Cookie数量: {cookie_count}
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               sid: str = None, spec_name_2: str = None, spec_value_2: str = None,
-                              buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False):
+                              buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False,
+                              bargain_flow_detected=..., bargain_success_detected=...):
         """插入或更新订单信息
 
         Args:
@@ -6586,6 +6656,12 @@ Cookie数量: {cookie_count}
                     if amount is not None:
                         update_fields.append("amount = ?")
                         update_values.append(amount)
+                    if bargain_flow_detected is not ...:
+                        update_fields.append("bargain_flow_detected = ?")
+                        update_values.append(1 if bargain_flow_detected else 0)
+                    if bargain_success_detected is not ...:
+                        update_fields.append("bargain_success_detected = ?")
+                        update_values.append(1 if bargain_success_detected else 0)
                     if order_status is not None:
                         update_fields.append("order_status = ?")
                         update_values.append(normalized_order_status or 'unknown')
@@ -6617,6 +6693,13 @@ Cookie数量: {cookie_count}
                         spec_name_2, spec_value_2, quantity, amount, normalized_order_status or 'unknown', cookie_id
                     ]
 
+                    if bargain_flow_detected is not ...:
+                        insert_fields.append('bargain_flow_detected')
+                        insert_values.append(1 if bargain_flow_detected else 0)
+                    if bargain_success_detected is not ...:
+                        insert_fields.append('bargain_success_detected')
+                        insert_values.append(1 if bargain_success_detected else 0)
+
                     if has_pre_refund_status and not clear_pre_refund_status:
                         insert_fields.append('pre_refund_status')
                         insert_values.append(normalized_pre_refund_status)
@@ -6641,7 +6724,7 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, pre_refund_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, pre_refund_status, cookie_id, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -6659,11 +6742,13 @@ Cookie数量: {cookie_count}
                         'spec_value_2': row[8],
                         'quantity': row[9],
                         'amount': row[10],
-                        'order_status': row[11],
-                        'pre_refund_status': row[12],
-                        'cookie_id': row[13],
-                        'created_at': row[14],
-                        'updated_at': row[15]
+                        'bargain_flow_detected': bool(row[11]),
+                        'bargain_success_detected': bool(row[12]),
+                        'order_status': row[13],
+                        'pre_refund_status': row[14],
+                        'cookie_id': row[15],
+                        'created_at': row[16],
+                        'updated_at': row[17]
                     }
                 return None
 
@@ -7019,7 +7104,7 @@ Cookie数量: {cookie_count}
 
                 sql = f'''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, cookie_id, created_at, updated_at
                 FROM orders
                 WHERE {" AND ".join(conditions)}
                 ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, created_at DESC
@@ -7057,10 +7142,12 @@ Cookie数量: {cookie_count}
                         'spec_value_2': row[8],
                         'quantity': row[9],
                         'amount': row[10],
-                        'order_status': row[11],
-                        'cookie_id': row[12],
-                        'created_at': row[13],
-                        'updated_at': row[14],
+                        'bargain_flow_detected': bool(row[11]),
+                        'bargain_success_detected': bool(row[12]),
+                        'order_status': row[13],
+                        'cookie_id': row[14],
+                        'created_at': row[15],
+                        'updated_at': row[16],
                     })
 
                 return orders
@@ -7892,6 +7979,251 @@ Cookie数量: {cookie_count}
         except Exception as e:
             logger.error(f"清理历史数据时出错: {e}")
             return {'error': str(e)}
+
+    # ==================== 定时任务管理 ====================
+
+    def calculate_next_daily_run(self, run_hour, random_delay_max=10, include_today=True):
+        """计算每日定时任务的下次运行时间"""
+        from datetime import datetime, timedelta
+        import random
+
+        now = datetime.now()
+        safe_hour = max(0, min(23, int(run_hour)))
+        safe_random_max = max(0, int(random_delay_max or 0))
+        random_min = random.randint(0, safe_random_max) if safe_random_max > 0 else 0
+
+        next_run = now.replace(hour=safe_hour, minute=random_min, second=0, microsecond=0)
+        if not include_today or next_run <= now:
+            next_run += timedelta(days=1)
+
+        return next_run.strftime('%Y-%m-%d %H:%M:%S')
+
+    def create_scheduled_task(self, name, task_type, account_id, user_id=None,
+                              interval_hours=24, delay_minutes=0, random_delay_max=10,
+                              next_run_at=None, enabled=1):
+        """创建定时任务
+
+        Args:
+            delay_minutes: 用作每日运行的目标小时 (0-23)
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                next_run_value = next_run_at or self.calculate_next_daily_run(
+                    delay_minutes,
+                    random_delay_max,
+                    include_today=True
+                )
+
+                self._execute_sql(cursor, """
+                    INSERT INTO scheduled_tasks (name, task_type, account_id, user_id,
+                        enabled, interval_hours, delay_minutes, random_delay_max, next_run_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, task_type, account_id, user_id,
+                      1 if enabled else 0, interval_hours, delay_minutes, random_delay_max,
+                      next_run_value))
+                self.conn.commit()
+                task_id = cursor.lastrowid
+                logger.info(f"创建定时任务成功: {name} (ID: {task_id})")
+                return task_id
+            except Exception as e:
+                logger.error(f"创建定时任务失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_scheduled_tasks(self, user_id=None):
+        """获取定时任务列表"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    self._execute_sql(cursor, """
+                        SELECT id, name, task_type, account_id, enabled, interval_hours,
+                               delay_minutes, random_delay_max, next_run_at, last_run_at,
+                               last_run_result, user_id, created_at, updated_at
+                        FROM scheduled_tasks WHERE user_id = ?
+                        ORDER BY id DESC
+                    """, (user_id,))
+                else:
+                    self._execute_sql(cursor, """
+                        SELECT id, name, task_type, account_id, enabled, interval_hours,
+                               delay_minutes, random_delay_max, next_run_at, last_run_at,
+                               last_run_result, user_id, created_at, updated_at
+                        FROM scheduled_tasks ORDER BY id DESC
+                    """)
+                rows = cursor.fetchall()
+                tasks = []
+                for row in rows:
+                    tasks.append({
+                        'id': row[0], 'name': row[1], 'task_type': row[2],
+                        'account_id': row[3], 'enabled': bool(row[4]),
+                        'interval_hours': row[5], 'delay_minutes': row[6],
+                        'random_delay_max': row[7], 'next_run_at': row[8],
+                        'last_run_at': row[9], 'last_run_result': row[10],
+                        'user_id': row[11], 'created_at': row[12], 'updated_at': row[13]
+                    })
+                return tasks
+            except Exception as e:
+                logger.error(f"获取定时任务列表失败: {e}")
+                return []
+
+    def get_scheduled_task(self, task_id):
+        """获取单个定时任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    SELECT id, name, task_type, account_id, enabled, interval_hours,
+                           delay_minutes, random_delay_max, next_run_at, last_run_at,
+                           last_run_result, user_id, created_at, updated_at
+                    FROM scheduled_tasks WHERE id = ?
+                """, (task_id,))
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'id': row[0], 'name': row[1], 'task_type': row[2],
+                        'account_id': row[3], 'enabled': bool(row[4]),
+                        'interval_hours': row[5], 'delay_minutes': row[6],
+                        'random_delay_max': row[7], 'next_run_at': row[8],
+                        'last_run_at': row[9], 'last_run_result': row[10],
+                        'user_id': row[11], 'created_at': row[12], 'updated_at': row[13]
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"获取定时任务失败: {e}")
+                return None
+
+    def get_scheduled_task_by_account(self, account_id, user_id=None, task_type=None):
+        """按账号获取最新的定时任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                params = [account_id]
+                sql = """
+                    SELECT id, name, task_type, account_id, enabled, interval_hours,
+                           delay_minutes, random_delay_max, next_run_at, last_run_at,
+                           last_run_result, user_id, created_at, updated_at
+                    FROM scheduled_tasks
+                    WHERE account_id = ?
+                """
+
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
+
+                if task_type is not None:
+                    sql += " AND task_type = ?"
+                    params.append(task_type)
+
+                sql += " ORDER BY enabled DESC, id DESC LIMIT 1"
+                self._execute_sql(cursor, sql, tuple(params))
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'id': row[0], 'name': row[1], 'task_type': row[2],
+                        'account_id': row[3], 'enabled': bool(row[4]),
+                        'interval_hours': row[5], 'delay_minutes': row[6],
+                        'random_delay_max': row[7], 'next_run_at': row[8],
+                        'last_run_at': row[9], 'last_run_result': row[10],
+                        'user_id': row[11], 'created_at': row[12], 'updated_at': row[13]
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"按账号获取定时任务失败: {e}")
+                return None
+
+    def update_scheduled_task(self, task_id, **kwargs):
+        """更新定时任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                allowed_fields = {'name', 'task_type', 'account_id', 'enabled',
+                                  'interval_hours', 'delay_minutes', 'random_delay_max',
+                                  'next_run_at', 'user_id'}
+                update_fields = []
+                params = []
+                for key, value in kwargs.items():
+                    if key in allowed_fields:
+                        update_fields.append(f"{key} = ?")
+                        params.append(value)
+
+                if not update_fields:
+                    return False
+
+                update_fields.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(task_id)
+                sql = f"UPDATE scheduled_tasks SET {', '.join(update_fields)} WHERE id = ?"
+                self._execute_sql(cursor, sql, tuple(params))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新定时任务失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def delete_scheduled_task(self, task_id):
+        """删除定时任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除定时任务失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_due_tasks(self):
+        """获取到期需要执行的任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                from datetime import datetime
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self._execute_sql(cursor, """
+                    SELECT id, name, task_type, account_id, enabled, interval_hours,
+                           delay_minutes, random_delay_max, next_run_at, last_run_at,
+                           last_run_result, user_id, created_at, updated_at
+                    FROM scheduled_tasks
+                    WHERE enabled = 1 AND next_run_at <= ?
+                    ORDER BY next_run_at ASC
+                """, (now,))
+                rows = cursor.fetchall()
+                tasks = []
+                for row in rows:
+                    tasks.append({
+                        'id': row[0], 'name': row[1], 'task_type': row[2],
+                        'account_id': row[3], 'enabled': bool(row[4]),
+                        'interval_hours': row[5], 'delay_minutes': row[6],
+                        'random_delay_max': row[7], 'next_run_at': row[8],
+                        'last_run_at': row[9], 'last_run_result': row[10],
+                        'user_id': row[11], 'created_at': row[12], 'updated_at': row[13]
+                    })
+                return tasks
+            except Exception as e:
+                logger.error(f"获取到期任务失败: {e}")
+                return []
+
+    def update_task_run_result(self, task_id, result, next_run_at):
+        """更新任务执行结果和下次运行时间"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                from datetime import datetime
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                self._execute_sql(cursor, """
+                    UPDATE scheduled_tasks
+                    SET last_run_at = ?, last_run_result = ?, next_run_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (now, result_str, next_run_at, task_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新任务执行结果失败: {e}")
+                self.conn.rollback()
+                return False
 
 
 # 全局单例

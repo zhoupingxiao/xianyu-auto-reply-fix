@@ -87,113 +87,303 @@ class OrderStatusHandler:
     def extract_order_id(self, message: dict) -> Optional[str]:
         """从消息中提取订单ID"""
         try:
-            order_id = None
-            
-            # 先查看消息的完整结构
             logger.info(f"🔍 完整消息结构: {message}")
-            
-            # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
-            message_1 = message.get('1', {})
-            content_json_str = ''
-            
-            if isinstance(message_1, dict):
-                logger.info(f"🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
-                
-                # 检查message['1']['6']的结构
-                message_1_6 = message_1.get('6', {})
-                if isinstance(message_1_6, dict):
-                    logger.info(f"🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
-                    # 方法1: 从button的targetUrl中提取orderId
-                    content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
-                else:
-                    logger.info(f"🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
-            
-            elif isinstance(message_1, list):
-                logger.info(f"🔍 message['1'] 是列表，长度: {len(message_1)}")
-                # 如果message['1']是列表，跳过这种提取方式
-            
-            elif isinstance(message_1, str):
-                logger.info(f"🔍 message['1'] 是字符串，长度: {len(message_1)}")
-                # 如果message['1']是字符串，跳过这种提取方式
-            
-            else:
-                logger.info(f"🔍 message['1'] 未知类型: {type(message_1)}")
-                # 其他类型，跳过这种提取方式
-            
-            if content_json_str:
-                try:
-                    content_data = json.loads(content_json_str)
-                    
-                    # 方法1a: 从button的targetUrl中提取orderId
-                    target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
-                    if target_url:
-                        # 从URL中提取orderId参数
-                        order_match = re.search(r'orderId=(\d+)', target_url)
-                        if order_match:
-                            order_id = order_match.group(1)
-                            logger.info(f'✅ 从button提取到订单ID: {order_id}')
-                    
-                    # 方法1b: 从main的targetUrl中提取order_detail的id
-                    if not order_id:
-                        main_target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('targetUrl', '')
-                        if main_target_url:
-                            order_match = re.search(r'order_detail\?id=(\d+)', main_target_url)
-                            if order_match:
-                                order_id = order_match.group(1)
-                                logger.info(f'✅ 从main targetUrl提取到订单ID: {order_id}')
-                
-                except Exception as parse_e:
-                    logger.error(f"解析内容JSON失败: {parse_e}")
-            
-            # 方法2: 从dynamicOperation中的order_detail URL提取orderId
-            if not order_id and content_json_str:
-                try:
-                    content_data = json.loads(content_json_str)
-                    dynamic_target_url = content_data.get('dynamicOperation', {}).get('changeContent', {}).get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
-                    if dynamic_target_url:
-                        # 从order_detail URL中提取id参数
-                        order_match = re.search(r'order_detail\?id=(\d+)', dynamic_target_url)
-                        if order_match:
-                            order_id = order_match.group(1)
-                            logger.info(f'✅ 从order_detail提取到订单ID: {order_id}')
-                except Exception as parse_e:
-                    logger.error(f"解析dynamicOperation JSON失败: {parse_e}")
-            
-            # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
-            if not order_id:
-                try:
-                    # 将整个消息转换为字符串进行搜索
-                    message_str = str(message)
-                    
-                    # 搜索各种可能的订单ID模式
-                    patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
-                        r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
-                        r'"id"\s*:\s*"?(\d{10,})"?',  # "id":"123456789" 或 "id":123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
-                    ]
-                    
-                    for pattern in patterns:
-                        matches = re.findall(pattern, message_str)
-                        if matches:
-                            # 取第一个匹配的订单ID
-                            order_id = matches[0]
-                            logger.info(f'✅ 从消息字符串中提取到订单ID: {order_id} (模式: {pattern})')
-                            break
-                
-                except Exception as search_e:
-                    logger.error(f"在消息字符串中搜索订单ID失败: {search_e}")
-            
-            if order_id:
-                logger.info(f'🎯 最终提取到订单ID: {order_id}')
-            else:
-                logger.error(f'❌ 未能从消息中提取到订单ID')
-            
-            return order_id
+
+            for source, candidate_text in self._collect_order_id_candidate_texts(message, root='message'):
+                order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
+                if order_id:
+                    logger.info(f'🎯 最终提取到订单ID: {order_id} (source={source})')
+                    return order_id
+
+            logger.error('❌ 未能从消息中提取到订单ID')
+            return None
         
         except Exception as e:
             logger.error(f"提取订单ID失败: {str(e)}")
             return None
+
+    def _extract_order_id_from_update_key(self, raw_text: Any) -> Optional[str]:
+        normalized_text = str(raw_text or '').strip()
+        if not normalized_text:
+            return None
+
+        direct_match_found = False
+        direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
+        if direct_match:
+            direct_match_found = True
+            normalized_text = direct_match.group(1)
+
+        colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
+        long_numeric_parts = [part for part in colon_parts if part.isdigit() and len(part) >= 16]
+        if long_numeric_parts:
+            return long_numeric_parts[0]
+
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
+        return None
+
+    def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
+        normalized_text = str(raw_text or '').strip()
+        if not normalized_text:
+            return None
+
+        patterns = [
+            r'orderId(?:=|:|%3[Dd]|\\u003[dD])\s*"?(\d{10,})',
+            r'bizOrderId["\']?\s*[:=]\s*"?(\d{10,})',
+            r'order[_-]?id["\']?\s*[:=]\s*"?(\d{10,})',
+            r'order[_-]?detail\?(?:[^\s#]*?&)?id=(\d{10,})',
+            r'order-detail\?(?:[^\s#]*?&)?orderId=(\d{10,})',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, normalized_text)
+            if match:
+                return match.group(1)
+
+        source_lower = source.lower()
+        text_lower = normalized_text.lower()
+        if (
+            'updatekey' in source_lower
+            or 'updatekey' in text_lower
+            or ('trade_' in text_lower and ':' in normalized_text)
+            or ('buyer_confirm' in text_lower and ':' in normalized_text)
+        ):
+            return self._extract_order_id_from_update_key(normalized_text)
+
+        return None
+
+    def _collect_order_id_candidate_texts(self, data: Any, root: str = 'message'):
+        candidates = []
+        seen = set()
+
+        def add_candidate(source: str, value: Any):
+            if value is None:
+                return
+            normalized_text = str(value).strip()
+            if not normalized_text:
+                return
+            dedupe_key = (source, normalized_text)
+            if dedupe_key in seen:
+                return
+            seen.add(dedupe_key)
+            candidates.append((source, normalized_text))
+
+            if normalized_text[:1] in {'{', '['}:
+                try:
+                    parsed_value = json.loads(normalized_text)
+                except Exception:
+                    return
+                walk_value(parsed_value, f'{source}.json')
+
+        def walk_value(value: Any, source: str):
+            if isinstance(value, dict):
+                for key, nested_value in value.items():
+                    nested_source = f'{source}.{key}'
+                    if isinstance(nested_value, (dict, list)):
+                        walk_value(nested_value, nested_source)
+                    else:
+                        add_candidate(nested_source, nested_value)
+            elif isinstance(value, list):
+                for index, nested_value in enumerate(value[:20]):
+                    walk_value(nested_value, f'{source}[{index}]')
+            else:
+                add_candidate(source, value)
+
+        walk_value(data, root)
+        return candidates
+
+    def _load_json_dict(self, raw_value: Any) -> Dict[str, Any]:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _get_status_priority(self, status: str) -> int:
+        priority_map = {
+            'processing': 10,
+            'pending_ship': 20,
+            'partial_success': 30,
+            'partial_pending_finalize': 30,
+            'shipped': 40,
+            'completed': 50,
+            'refunding': 60,
+            'refund_cancelled': 65,
+            'cancelled': 70,
+        }
+        return priority_map.get(status, 0)
+
+    def _extract_system_message_meta(self, message: dict) -> Dict[str, Any]:
+        message_1 = message.get('1', {}) if isinstance(message, dict) else {}
+        message_10 = message_1.get('10', {}) if isinstance(message_1, dict) else {}
+        message_6 = message_1.get('6', {}) if isinstance(message_1, dict) else {}
+        message_6_3 = message_6.get('3', {}) if isinstance(message_6, dict) else {}
+        payload = self._load_json_dict(message_6_3.get('5', '') if isinstance(message_6_3, dict) else '')
+        biz_tag_raw = str(message_10.get('bizTag', '') or '').strip() if isinstance(message_10, dict) else ''
+        biz_tag_dict = self._load_json_dict(biz_tag_raw)
+        ext_json_dict = self._load_json_dict(message_10.get('extJson', '') if isinstance(message_10, dict) else '')
+
+        try:
+            button_text = str(
+                payload.get('dxCard', {})
+                .get('item', {})
+                .get('main', {})
+                .get('exContent', {})
+                .get('button', {})
+                .get('text', '')
+            ).strip()
+        except Exception:
+            button_text = ''
+
+        try:
+            card_title = str(
+                payload.get('dxCard', {})
+                .get('item', {})
+                .get('main', {})
+                .get('exContent', {})
+                .get('title', '')
+            ).strip()
+        except Exception:
+            card_title = ''
+
+        message_direction = message_1.get('7', 0) if isinstance(message_1, dict) else 0
+        content_type = message_6_3.get('4', 0) if isinstance(message_6_3, dict) else 0
+        task_name = str(biz_tag_dict.get('taskName') or '').strip()
+        is_system_biz = bool(task_name) or 'SECURITY' in biz_tag_raw or 'taskId' in biz_tag_raw
+
+        return {
+            'message_direction': message_direction,
+            'content_type': content_type,
+            'is_system_message': message_direction == 1 or content_type == 6 or is_system_biz,
+            'message_red_reminder': str(message_10.get('redReminder', '') or '').strip() if isinstance(message_10, dict) else '',
+            'top_red_reminder': str(message.get('3', {}).get('redReminder', '') or '').strip() if isinstance(message, dict) and isinstance(message.get('3'), dict) else '',
+            'reminder_content': str(message_10.get('reminderContent', '') or '').strip() if isinstance(message_10, dict) else '',
+            'detail_notice': str(message_10.get('detailNotice', '') or '').strip() if isinstance(message_10, dict) else '',
+            'reminder_notice': str(message_10.get('reminderNotice', '') or '').strip() if isinstance(message_10, dict) else '',
+            'task_name': task_name,
+            'update_key': str(ext_json_dict.get('updateKey') or '').strip(),
+            'button_text': button_text,
+            'card_title': card_title,
+        }
+
+    def _match_system_status_from_text(self, text: Any) -> Optional[str]:
+        normalized = str(text or '').strip()
+        if not normalized:
+            return None
+
+        exact_mapping = {
+            '[买家确认收货，交易成功]': 'completed',
+            '[你已确认收货，交易成功]': 'completed',
+            '买家已确认收货，交易成功': 'completed',
+            '已确认收货，交易成功': 'completed',
+            '快给ta一个评价吧~': 'completed',
+            '快给ta一个评价吧～': 'completed',
+            '[你已发货]': 'shipped',
+            '你已发货': 'shipped',
+            '[你已发货，请等待买家确认收货]': 'shipped',
+            '[我已付款，等待你发货]': 'pending_ship',
+            '[已付款，待发货]': 'pending_ship',
+            '[买家已付款]': 'pending_ship',
+            '[付款完成]': 'pending_ship',
+            '[记得及时发货]': 'pending_ship',
+            '等待你发货': 'pending_ship',
+            '等待卖家发货': 'pending_ship',
+            '去发货': 'pending_ship',
+            '[我已拍下，待付款]': 'processing',
+            '买家已拍下，待付款': 'processing',
+            '等待买家付款': 'processing',
+            '[退款成功，钱款已原路退返]': 'cancelled',
+            '[你关闭了订单，钱款已原路退返]': 'cancelled',
+            '交易关闭': 'cancelled',
+            '退款撤销': 'refund_cancelled',
+            '等待买家收货': 'shipped',
+            '已发货': 'shipped',
+            '交易成功': 'completed',
+        }
+        if normalized in exact_mapping:
+            return exact_mapping[normalized]
+
+        lowered = normalized.lower()
+        if '钱款已原路退返' in normalized or '订单关闭' in normalized:
+            return 'cancelled'
+        if '退款撤销' in normalized:
+            return 'refund_cancelled'
+        if '退款中' in normalized or '退货退款' in normalized or '退款关闭' in normalized:
+            return 'refunding'
+        if '买家确认收货' in normalized:
+            return 'completed'
+        if '快给ta一个评价吧' in normalized:
+            return 'completed'
+        if '已发货_卖家' in normalized or '等待买家收货' in normalized:
+            return 'shipped'
+        if '付款完成待发货' in normalized or 'trade_paid_done_seller' in lowered:
+            return 'pending_ship'
+        if '已拍下_未付款' in normalized or '1_not_pay_seller' in lowered:
+            return 'processing'
+        return None
+
+    def _resolve_system_message_status(self, message: dict, send_message: str):
+        message_meta = self._extract_system_message_meta(message)
+        candidates = []
+
+        refund_status = self._check_refund_message(message, send_message)
+        if refund_status:
+            candidates.append({
+                'status': refund_status,
+                'source': 'refund_card',
+                'text': send_message,
+                'signal_priority': 90,
+            })
+
+        signal_inputs = [
+            ('top_red_reminder', message_meta.get('top_red_reminder'), 80),
+            ('message_red_reminder', message_meta.get('message_red_reminder'), 80),
+            ('button_text', message_meta.get('button_text'), 80),
+            ('send_message', send_message, 70),
+            ('reminder_content', message_meta.get('reminder_content'), 70),
+            ('card_title', message_meta.get('card_title'), 60),
+            ('detail_notice', message_meta.get('detail_notice'), 50),
+            ('task_name', message_meta.get('task_name'), 40),
+            ('update_key', message_meta.get('update_key'), 30),
+            ('reminder_notice', message_meta.get('reminder_notice'), 20),
+        ]
+
+        seen = set()
+        for source_name, raw_text, signal_priority in signal_inputs:
+            normalized_text = str(raw_text or '').strip()
+            if not normalized_text:
+                continue
+
+            matched_status = self._match_system_status_from_text(normalized_text)
+            if not matched_status:
+                continue
+
+            dedupe_key = (matched_status, source_name, normalized_text)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            candidates.append({
+                'status': matched_status,
+                'source': source_name,
+                'text': normalized_text,
+                'signal_priority': signal_priority,
+            })
+
+        if not candidates:
+            return None, message_meta, []
+
+        candidates.sort(
+            key=lambda item: (item.get('signal_priority', 0), self._get_status_priority(item.get('status'))),
+            reverse=True,
+        )
+        return candidates[0].get('status'), message_meta, candidates
 
     def _build_message_hash(self, message: Any) -> Optional[int]:
         """构建待处理消息的匹配哈希。"""
@@ -238,6 +428,10 @@ class OrderStatusHandler:
         if message_hash is None and message is not None:
             message_hash = self._build_message_hash(message)
 
+        message_timestamp_ms = raw_context.get('message_timestamp_ms')
+        if message_timestamp_ms is None and message is not None:
+            message_timestamp_ms = self._extract_message_timestamp_ms(message)
+
         sid = self._normalize_match_text(raw_context.get('sid'))
         buyer_id = self._normalize_match_text(raw_context.get('buyer_id'))
         item_id = self._normalize_item_match_value(raw_context.get('item_id'))
@@ -248,6 +442,7 @@ class OrderStatusHandler:
 
         return {
             'message_hash': message_hash,
+            'message_timestamp_ms': message_timestamp_ms,
             'sid': sid,
             'buyer_id': buyer_id,
             'item_id': item_id,
@@ -273,9 +468,70 @@ class OrderStatusHandler:
             pending_msg.get('item_id') == match_context.get('item_id')
         )
 
+    def _is_terminal_pending_status(self, status: Optional[str]) -> bool:
+        return status in {'shipped', 'completed', 'cancelled', 'refund_cancelled'}
+
+    def _pending_message_matches_fields(self, pending_msg: Dict[str, Any], match_context: Dict[str, Any], fields: tuple) -> bool:
+        for field in fields:
+            expected_value = match_context.get(field)
+            if not expected_value or pending_msg.get(field) != expected_value:
+                return False
+        return True
+
+    def _is_pending_terminal_message_within_gap(self, pending_msg: Dict[str, Any], current_timestamp_ms: Optional[int]) -> bool:
+        if not self._is_terminal_pending_status(pending_msg.get('new_status')):
+            return True
+
+        pending_timestamp_ms = pending_msg.get('message_timestamp_ms')
+        if not pending_timestamp_ms or not current_timestamp_ms:
+            return False
+
+        max_gap_seconds = self.config.get('pending_terminal_bind_max_gap_seconds', 90)
+        max_gap_ms = int(max_gap_seconds * 1000)
+        gap_ms = abs(int(current_timestamp_ms) - int(pending_timestamp_ms))
+        return gap_ms <= max_gap_ms
+
+    def _select_terminal_pending_message_index(self, pending_messages: list, match_context: Dict[str, Any], queue_name: str):
+        current_timestamp_ms = match_context.get('message_timestamp_ms')
+        if not current_timestamp_ms:
+            return None, 'terminal_no_timestamp'
+
+        fallback_matchers = [
+            ('terminal_sid_item_buyer_recent', ('sid', 'item_id', 'buyer_id')),
+            ('terminal_sid_item_recent', ('sid', 'item_id')),
+            ('terminal_sid_buyer_recent', ('sid', 'buyer_id')),
+            ('terminal_sid_recent', ('sid',)),
+        ]
+
+        for mode, fields in fallback_matchers:
+            if any(not match_context.get(field) for field in fields):
+                continue
+
+            candidate_indexes = [
+                i for i, msg in enumerate(pending_messages)
+                if self._is_terminal_pending_status(msg.get('new_status'))
+                and self._pending_message_matches_fields(msg, match_context, fields)
+                and self._is_pending_terminal_message_within_gap(msg, current_timestamp_ms)
+            ]
+
+            if len(candidate_indexes) == 1:
+                return candidate_indexes[0], mode
+
+            if len(candidate_indexes) > 1:
+                logger.warning(
+                    f"{queue_name} 待处理队列终态近邻回退命中多个候选，拒绝匹配: "
+                    f"mode={mode}, candidates={len(candidate_indexes)}, "
+                    f"{self._format_pending_match_context(match_context)}"
+                )
+                return None, f'ambiguous_{mode}'
+
+        return None, 'terminal_recent_miss'
+
     def _select_pending_message_index(self, pending_messages: list, match_context: Dict[str, Any], queue_name: str):
         if not pending_messages:
             return None, 'empty'
+
+        ambiguous_reason = None
 
         message_hash = match_context.get('message_hash')
         if message_hash is not None:
@@ -297,7 +553,7 @@ class OrderStatusHandler:
                     f"{queue_name} 待处理队列出现多个 message_hash 候选，严格模式拒绝匹配: "
                     f"candidates={len(hash_candidates)}, {self._format_pending_match_context(match_context)}"
                 )
-                return None, 'ambiguous_message_hash'
+                ambiguous_reason = 'ambiguous_message_hash'
 
         if match_context.get('has_strong_match_key'):
             strong_candidates = [
@@ -311,7 +567,18 @@ class OrderStatusHandler:
                     f"{queue_name} 待处理队列出现多个强关联键候选，严格模式拒绝匹配: "
                     f"candidates={len(strong_candidates)}, {self._format_pending_match_context(match_context)}"
                 )
-                return None, 'ambiguous_strong_key'
+                ambiguous_reason = 'ambiguous_strong_key'
+
+        terminal_index, terminal_mode = self._select_terminal_pending_message_index(
+            pending_messages,
+            match_context,
+            queue_name,
+        )
+        if terminal_index is not None:
+            return terminal_index, terminal_mode
+
+        if ambiguous_reason:
+            return None, ambiguous_reason
 
         return None, 'miss'
 
@@ -420,7 +687,7 @@ class OrderStatusHandler:
         return success
 
     def _should_bind_pending_terminal_message(self, pending_msg: Dict[str, Any], message: dict) -> bool:
-        if pending_msg.get('new_status') != 'cancelled':
+        if not self._is_terminal_pending_status(pending_msg.get('new_status')):
             return True
 
         pending_timestamp_ms = pending_msg.get('message_timestamp_ms')
@@ -428,35 +695,55 @@ class OrderStatusHandler:
         if not pending_timestamp_ms or not current_timestamp_ms:
             return True
 
+        if self._is_pending_terminal_message_within_gap(pending_msg, current_timestamp_ms):
+            return True
+
         max_gap_seconds = self.config.get('pending_terminal_bind_max_gap_seconds', 90)
         max_gap_ms = int(max_gap_seconds * 1000)
-        if current_timestamp_ms - pending_timestamp_ms <= max_gap_ms:
-            return True
+        gap_ms = abs(int(current_timestamp_ms) - int(pending_timestamp_ms))
 
         logger.warning(
             "待处理终态消息与当前提取订单时间差过大，拒绝绑定以避免串单: "
-            f"gap_ms={current_timestamp_ms - pending_timestamp_ms}, max_gap_ms={max_gap_ms}"
+            f"status={pending_msg.get('new_status')}, gap_ms={gap_ms}, max_gap_ms={max_gap_ms}"
         )
         return False
+
+    def _get_terminal_resolution_statuses(self, pending_status: Optional[str]) -> list:
+        if pending_status == 'cancelled':
+            return ['cancelled']
+        if pending_status == 'refund_cancelled':
+            return ['refund_cancelled', 'pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed']
+        if pending_status == 'shipped':
+            return ['shipped', 'completed', 'refunding', 'cancelled']
+        if pending_status == 'completed':
+            return ['completed', 'refunding', 'cancelled']
+        return []
 
     def _pending_terminal_message_already_resolved(self, order_id: str, cookie_id: str,
                                                    pending_msg: Dict[str, Any],
                                                    match_context: Dict[str, Any]) -> bool:
-        if pending_msg.get('new_status') != 'cancelled':
+        pending_status = pending_msg.get('new_status')
+        if not self._is_terminal_pending_status(pending_status):
+            return False
+
+        resolution_statuses = self._get_terminal_resolution_statuses(pending_status)
+        if not resolution_statuses:
             return False
 
         resolved_orders = self._find_recent_orders_for_match_context(
             cookie_id=cookie_id,
             match_context=match_context,
-            statuses=['cancelled'],
+            statuses=resolution_statuses,
             exclude_order_id=order_id
         )
         if not resolved_orders:
             return False
 
         logger.info(
-            "检测到同匹配键下已有其它已关闭订单，视为待处理终态消息已消化: "
-            f"current_order_id={order_id}, resolved_order_id={resolved_orders[0].get('order_id')}"
+            "检测到同匹配键下已有其它终态订单，视为待处理终态消息已消化: "
+            f"pending_status={pending_status}, current_order_id={order_id}, "
+            f"resolved_order_id={resolved_orders[0].get('order_id')}, "
+            f"resolved_status={resolved_orders[0].get('order_status')}"
         )
         return True
 
@@ -952,30 +1239,23 @@ class OrderStatusHandler:
             bool: 是否处理了订单状态更新
         """
         try:
-            # 定义消息类型与状态的映射
-            message_status_mapping = {
-                '[买家确认收货，交易成功]': 'completed',
-                '[你已确认收货，交易成功]': 'completed',  # 已完成
-                '[你已发货]': 'shipped',  # 已发货
-                '你已发货': 'shipped',  # 已发货（无方括号）
-                '[你已发货，请等待买家确认收货]': 'shipped',  # 已发货（完整格式）
-                '[我已付款，等待你发货]': 'pending_ship',  # 已付款，等待发货
-                '[我已拍下，待付款]': 'processing',  # 已拍下，待付款
-                '[买家已付款]': 'pending_ship',  # 买家已付款
-                '[付款完成]': 'pending_ship',  # 付款完成
-                '[已付款，待发货]': 'pending_ship',  # 已付款，待发货
-                '[退款成功，钱款已原路退返]': 'cancelled',  # 退款成功，设置为已关闭
-                '[你关闭了订单，钱款已原路退返]': 'cancelled',  # 卖家关闭订单，设置为已关闭
-            }
-            
-            # 特殊处理：检查退款申请消息（需要同时识别标题和按钮文本）
-            refund_status = self._check_refund_message(message, send_message)
-            if refund_status:
-                new_status = refund_status
-            elif send_message in message_status_mapping:
-                new_status = message_status_mapping[send_message]
-            else:
+            new_status, message_meta, status_candidates = self._resolve_system_message_status(message, send_message)
+            if not new_status:
                 return False
+
+            if not message_meta.get('is_system_message') and not any(
+                candidate.get('source') == 'refund_card' for candidate in status_candidates
+            ):
+                return False
+
+            candidate_summary = ', '.join(
+                f"{candidate.get('status')}<{candidate.get('source')}>:{candidate.get('text')}"
+                for candidate in status_candidates[:6]
+            )
+            logger.info(
+                f'[{msg_time}] 【{cookie_id}】系统消息状态候选: {candidate_summary or "none"}，'
+                f'最终采用 {new_status}'
+            )
             
             # 提取订单ID
             order_id = self.extract_order_id(message)
@@ -1042,21 +1322,8 @@ class OrderStatusHandler:
             # 如果订单存在，检查是否需要忽略这次状态更新
             if current_order and current_order.get('order_status'):
                 current_status = current_order.get('order_status')
-                
-                # 定义状态优先级（数字越大，状态越靠后）
-                status_priority = {
-                    'processing': 1,      # 处理中
-                    'pending_ship': 2,    # 待发货
-                    'partial_success': 3,  # 部分发货
-                    'partial_pending_finalize': 3,  # 部分待收尾
-                    'shipped': 4,         # 已发货
-                    'completed': 5,       # 已完成
-                    'refunding': 2,       # 退款中（与待发货同级）
-                    'cancelled': 6,       # 已取消（终态）
-                }
-                
-                current_priority = status_priority.get(current_status, 0)
-                new_priority = status_priority.get(new_status, 0)
+                current_priority = self._get_status_priority(current_status)
+                new_priority = self._get_status_priority(new_status)
                 
                 # 如果新状态的优先级低于当前状态，且不是特殊状态（退款、取消），则忽略
                 if new_priority < current_priority and new_status not in ['refunding', 'cancelled', 'refund_cancelled']:

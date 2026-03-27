@@ -17,6 +17,7 @@ import sys
 import json
 import hashlib
 import subprocess
+from urllib import request
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -196,11 +197,32 @@ def load_manifest_from_tag(base_dir: Path, tag: Optional[str]) -> Optional[Dict[
     if not tag:
         return None
 
+    owner, repo = read_repo_config()
+    manifest_url = f"https://github.com/{owner}/{repo}/releases/download/{tag}/update_files.json"
+    token = (
+        os.getenv('UPDATE_GITHUB_TOKEN')
+        or os.getenv('GITHUB_TOKEN')
+        or os.getenv('GH_TOKEN')
+    )
+    headers = {
+        'User-Agent': f'update-manifest-loader/{tag}',
+        'Accept': 'application/octet-stream',
+    }
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
     try:
-        manifest_text = run_git_command(base_dir, ['show', f'{tag}:update_files.json'])
+        req = request.Request(manifest_url, headers=headers)
+        with request.urlopen(req, timeout=30) as response:
+            manifest_text = response.read().decode('utf-8')
     except Exception as exc:
-        print(f"提示: 无法从 tag {tag} 读取 update_files.json: {exc}")
-        return None
+        print(f"提示: 无法从 release {tag} 读取 update_files.json: {exc}")
+
+        try:
+            manifest_text = run_git_command(base_dir, ['show', f'{tag}:update_files.json'])
+        except Exception as git_exc:
+            print(f"提示: 无法从 tag {tag} 读取 update_files.json: {git_exc}")
+            return None
 
     try:
         return json.loads(manifest_text)
