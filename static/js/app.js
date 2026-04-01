@@ -1224,6 +1224,31 @@ function parseUtcDateTime(dateString) {
     return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+const beijingMinuteFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    hourCycle: 'h23'
+});
+
+function formatBeijingDateTime(dateString) {
+    const date = parseUtcDateTime(dateString);
+    if (!date) return '--';
+
+    const parts = {};
+    beijingMinuteFormatter.formatToParts(date).forEach(part => {
+        if (part.type !== 'literal') {
+            parts[part.type] = part.value;
+        }
+    });
+
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
 function isTodayOrder(createdAt) {
     const orderDate = parseUtcDateTime(createdAt);
     if (!orderDate) return false;
@@ -9035,7 +9060,7 @@ function initItemsSearch() {
 // 刷新商品列表
 async function refreshItems() {
     await refreshItemsData();
-    showToast('商品列表已刷新', 'success');
+    showToast('本地商品列表已刷新', 'success');
 }
 
 // 获取商品信息
@@ -9057,7 +9082,7 @@ async function getAllItemsFromAccount() {
     // 显示加载状态
     const button = event.target;
     const originalText = button.innerHTML;
-    button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>获取中...';
+    button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>同步中...';
     button.disabled = true;
 
     try {
@@ -9077,18 +9102,18 @@ async function getAllItemsFromAccount() {
     if (response.ok) {
         const data = await response.json();
         if (data.success) {
-        showToast(`成功获取第${pageNumber}页 ${data.current_count} 个商品，请查看控制台日志`, 'success');
+        showToast(`成功同步第${pageNumber}页 ${data.current_count} 个商品，最新详情已更新`, 'success');
         // 刷新商品列表（保持筛选器选择）
         await refreshItemsData();
         } else {
-        showToast(data.message || '获取商品信息失败', 'danger');
+        showToast(data.message || '同步商品信息失败', 'danger');
         }
     } else {
         throw new Error(`HTTP ${response.status}`);
     }
     } catch (error) {
-    console.error('获取商品信息失败:', error);
-    showToast('获取商品信息失败', 'danger');
+    console.error('同步商品信息失败:', error);
+    showToast('同步商品信息失败', 'danger');
     } finally {
     // 恢复按钮状态
     button.innerHTML = originalText;
@@ -9109,7 +9134,7 @@ async function getAllItemsFromAccountAll() {
     // 显示加载状态
     const button = event.target;
     const originalText = button.innerHTML;
-    button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>获取中...';
+    button.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>同步中...';
     button.disabled = true;
 
     try {
@@ -9128,20 +9153,20 @@ async function getAllItemsFromAccountAll() {
         const data = await response.json();
         if (data.success) {
         const message = data.total_pages ?
-            `成功获取 ${data.total_count} 个商品（共${data.total_pages}页），请查看控制台日志` :
-            `成功获取商品信息，请查看控制台日志`;
+            `成功同步 ${data.total_count} 个商品（共${data.total_pages}页），最新详情已更新` :
+            `成功同步商品信息，最新详情已更新`;
         showToast(message, 'success');
         // 刷新商品列表（保持筛选器选择）
         await refreshItemsData();
         } else {
-        showToast(data.message || '获取商品信息失败', 'danger');
+        showToast(data.message || '同步商品信息失败', 'danger');
         }
     } else {
         throw new Error(`HTTP ${response.status}`);
     }
     } catch (error) {
-    console.error('获取商品信息失败:', error);
-    showToast('获取商品信息失败', 'danger');
+    console.error('同步商品信息失败:', error);
+    showToast('同步商品信息失败', 'danger');
     } finally {
     // 恢复按钮状态
     button.innerHTML = originalText;
@@ -10477,24 +10502,53 @@ function updateRefreshCookieStatus(message) {
 
 // 轮询检查刷新Cookie状态
 let refreshCookieCheckInterval = null;
+let refreshCookiePollingState = {
+    sessionId: null,
+    cookieId: null,
+    inFlight: false,
+    completed: false
+};
+
+function stopRefreshCookiePolling(sessionId = refreshCookiePollingState.sessionId) {
+    if (sessionId && refreshCookiePollingState.sessionId && refreshCookiePollingState.sessionId !== sessionId) {
+        return;
+    }
+
+    if (refreshCookieCheckInterval) {
+        clearInterval(refreshCookieCheckInterval);
+        refreshCookieCheckInterval = null;
+    }
+
+    refreshCookiePollingState.completed = true;
+}
 
 function startRefreshCookiePolling(sessionId, cookieId) {
     // 清除之前的轮询
-    if (refreshCookieCheckInterval) {
-        clearInterval(refreshCookieCheckInterval);
-    }
+    stopRefreshCookiePolling();
+
+    refreshCookiePollingState = {
+        sessionId,
+        cookieId,
+        inFlight: false,
+        completed: false
+    };
 
     let checkCount = 0;
     const maxChecks = 120; // 最多检查120次，每次2秒，共4分钟
 
-    refreshCookieCheckInterval = setInterval(async () => {
+    const pollRefreshCookieStatus = async () => {
+        if (refreshCookiePollingState.completed || refreshCookiePollingState.inFlight || refreshCookiePollingState.sessionId !== sessionId) {
+            return;
+        }
+
+        refreshCookiePollingState.inFlight = true;
         checkCount++;
 
         if (checkCount > maxChecks) {
-            clearInterval(refreshCookieCheckInterval);
-            refreshCookieCheckInterval = null;
+            stopRefreshCookiePolling(sessionId);
             toggleLoading(false);
             showToast('刷新Cookie超时，请重试', 'warning');
+            refreshCookiePollingState.inFlight = false;
             return;
         }
 
@@ -10505,6 +10559,11 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                 }
             });
             const data = await response.json();
+
+            if (refreshCookiePollingState.sessionId !== sessionId || refreshCookiePollingState.completed) {
+                return;
+            }
+
             console.log('刷新Cookie状态检查:', data); // 调试日志
 
             switch (data.status) {
@@ -10519,8 +10578,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     showPasswordLoginQRCode(data.screenshot_path || data.verification_url || data.qr_code_url, data.screenshot_path);
                     break;
                 case 'success':
-                    clearInterval(refreshCookieCheckInterval);
-                    refreshCookieCheckInterval = null;
+                    stopRefreshCookiePolling(sessionId);
                     toggleLoading(false);
                     showToast(`账号 ${cookieId} Cookie刷新成功！`, 'success');
                     // 隐藏表单
@@ -10532,22 +10590,33 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                 case 'error':
                 case 'not_found':
                 case 'forbidden':
-                    clearInterval(refreshCookieCheckInterval);
-                    refreshCookieCheckInterval = null;
+                    stopRefreshCookiePolling(sessionId);
                     toggleLoading(false);
                     showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
                     break;
             }
         } catch (error) {
             console.error('检查刷新状态失败:', error);
+        } finally {
+            if (refreshCookiePollingState.sessionId === sessionId) {
+                refreshCookiePollingState.inFlight = false;
+            }
         }
-    }, 2000);
+    };
+
+    refreshCookieCheckInterval = setInterval(pollRefreshCookieStatus, 2000);
+    pollRefreshCookieStatus();
 }
 
 // ========================= 账号密码登录相关函数 =========================
 
 let passwordLoginCheckInterval = null;
 let passwordLoginSessionId = null;
+let passwordLoginPollingState = {
+    sessionId: null,
+    inFlight: false,
+    completed: false
+};
 
 // 处理账号密码登录表单提交
 async function handlePasswordLogin(event) {
@@ -10605,19 +10674,27 @@ async function handlePasswordLogin(event) {
 
 // 开始检查账号密码登录状态
 function startPasswordLoginCheck() {
-    if (passwordLoginCheckInterval) {
-        clearInterval(passwordLoginCheckInterval);
-    }
-    
+    clearPasswordLoginCheck();
+
+    passwordLoginPollingState = {
+        sessionId: passwordLoginSessionId,
+        inFlight: false,
+        completed: false
+    };
+
     passwordLoginCheckInterval = setInterval(checkPasswordLoginStatus, 2000); // 每2秒检查一次
+    checkPasswordLoginStatus();
 }
 
 // 检查账号密码登录状态
 async function checkPasswordLoginStatus() {
-    if (!passwordLoginSessionId) return;
+    if (!passwordLoginSessionId || passwordLoginPollingState.completed || passwordLoginPollingState.inFlight) return;
+
+    const sessionId = passwordLoginSessionId;
+    passwordLoginPollingState.inFlight = true;
     
     try {
-        const response = await fetch(`${apiBase}/password-login/check/${passwordLoginSessionId}`, {
+        const response = await fetch(`${apiBase}/password-login/check/${sessionId}`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -10625,6 +10702,11 @@ async function checkPasswordLoginStatus() {
         
         if (response.ok) {
             const data = await response.json();
+
+            if (passwordLoginPollingState.sessionId !== sessionId || passwordLoginPollingState.completed) {
+                return;
+            }
+
             console.log('账号密码登录状态检查:', data); // 调试日志
             
             switch (data.status) {
@@ -10638,11 +10720,13 @@ async function checkPasswordLoginStatus() {
                     break;
                 case 'success':
                     // 登录成功
+                    passwordLoginPollingState.completed = true;
                     clearPasswordLoginCheck();
                     handlePasswordLoginSuccess(data);
                     break;
                 case 'failed':
                     // 登录失败
+                    passwordLoginPollingState.completed = true;
                     clearPasswordLoginCheck();
                     handlePasswordLoginFailure(data);
                     break;
@@ -10650,6 +10734,7 @@ async function checkPasswordLoginStatus() {
                 case 'forbidden':
                 case 'error':
                     // 错误情况
+                    passwordLoginPollingState.completed = true;
                     clearPasswordLoginCheck();
                     showToast(data.message || '登录检查失败', 'danger');
                     resetPasswordLoginForm();
@@ -10659,10 +10744,12 @@ async function checkPasswordLoginStatus() {
             // 响应不OK时也尝试解析错误消息
             try {
                 const errorData = await response.json();
+                passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
                 showToast(errorData.message || '登录检查失败', 'danger');
                 resetPasswordLoginForm();
             } catch (e) {
+                passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
                 showToast('登录检查失败，请重试', 'danger');
                 resetPasswordLoginForm();
@@ -10670,9 +10757,14 @@ async function checkPasswordLoginStatus() {
         }
     } catch (error) {
         console.error('检查账号密码登录状态失败:', error);
+        passwordLoginPollingState.completed = true;
         clearPasswordLoginCheck();
         showToast('网络错误，请重试', 'danger');
         resetPasswordLoginForm();
+    } finally {
+        if (passwordLoginPollingState.sessionId === sessionId) {
+            passwordLoginPollingState.inFlight = false;
+        }
     }
 }
 
@@ -10740,7 +10832,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
         
         // 更新状态文本
         if (statusText) {
-            statusText.textContent = '需要闲鱼验证，请点击下方按钮跳转到验证页面';
+            statusText.textContent = '服务端已保持原始会话；如二维码暂未显示，可使用下方兜底入口';
         }
     } else {
         // 都没有，显示等待
@@ -10784,7 +10876,7 @@ function createPasswordLoginQRModal() {
                             <a id="passwordLoginVerificationLink" href="#" target="_blank" 
                                class="btn btn-warning btn-lg" style="display: none;">
                                 <i class="bi bi-shield-check me-2"></i>
-                                跳转闲鱼人脸验证
+                                打开兜底验证页面
                             </a>
                         </div>
                         
@@ -10853,6 +10945,11 @@ function clearPasswordLoginCheck() {
 function resetPasswordLoginForm() {
     passwordLoginSessionId = null;
     clearPasswordLoginCheck();
+    passwordLoginPollingState = {
+        sessionId: null,
+        inFlight: false,
+        completed: false
+    };
     
     const submitBtn = document.querySelector('#passwordLoginFormElement button[type="submit"]');
     if (submitBtn) {
@@ -10865,6 +10962,7 @@ function resetPasswordLoginForm() {
 
 let qrCodeCheckInterval = null;
 let qrCodeSessionId = null;
+let qrCodeModalEventsBound = false;
 let qrCodeVerificationState = {
     renderKey: '',
     toastShown: false,
@@ -10891,20 +10989,48 @@ function resetQRCodeVerificationState() {
     qrCodeVerificationState.activeSessionId = null;
 }
 
+function closeQRCodeLoginModal(delay = 3000) {
+    setTimeout(() => {
+        const modalElement = document.getElementById('qrCodeLoginModal');
+        if (!modalElement) {
+            loadCookies();
+            return;
+        }
+
+        const modal = bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement);
+        modal.hide();
+        loadCookies();
+    }, delay);
+}
+
+function initializeQRCodeLoginModal() {
+    const modalElement = document.getElementById('qrCodeLoginModal');
+    if (!modalElement || qrCodeModalEventsBound) {
+        return modalElement;
+    }
+
+    modalElement.addEventListener('shown.bs.modal', function () {
+        generateQRCode();
+    });
+
+    modalElement.addEventListener('hidden.bs.modal', function () {
+        clearQRCodeCheck();
+    });
+
+    qrCodeModalEventsBound = true;
+    return modalElement;
+}
+
 // 显示扫码登录模态框
 function showQRCodeLogin() {
-    const modal = new bootstrap.Modal(document.getElementById('qrCodeLoginModal'));
+    const modalElement = initializeQRCodeLoginModal();
+    if (!modalElement) {
+        showToast('扫码登录弹窗未找到，请刷新页面重试', 'danger');
+        return;
+    }
+
+    const modal = bootstrap.Modal.getInstance(modalElement) || new bootstrap.Modal(modalElement);
     modal.show();
-
-    // 模态框显示后生成二维码
-    modal._element.addEventListener('shown.bs.modal', function () {
-    generateQRCode();
-    });
-
-    // 模态框关闭时清理定时器
-    modal._element.addEventListener('hidden.bs.modal', function () {
-    clearQRCodeCheck();
-    });
 }
 
 // 刷新二维码（兼容旧函数名）
@@ -11026,12 +11152,22 @@ async function checkQRCodeStatus() {
         case 'scanned':
             document.getElementById('statusText').textContent = '已扫码，请在手机上确认...';
             break;
+        case 'confirmed':
+            document.getElementById('statusText').textContent = '已确认，正在获取Cookie...';
+            break;
         case 'success':
             qrCodeVerificationState.completed = true;
             document.getElementById('statusText').textContent = '登录成功！';
             document.getElementById('statusSpinner').style.display = 'none';
             clearQRCodeCheck();
             handleQRCodeSuccess(data);
+            break;
+        case 'error':
+            qrCodeVerificationState.completed = true;
+            document.getElementById('statusText').textContent = '登录失败';
+            document.getElementById('statusSpinner').style.display = 'none';
+            clearQRCodeCheck();
+            showToast(data.message || '扫码登录失败', 'danger');
             break;
         case 'expired':
             document.getElementById('statusText').textContent = '二维码已过期';
@@ -11058,7 +11194,7 @@ async function checkQRCodeStatus() {
             document.getElementById('statusText').textContent = '登录已完成';
             document.getElementById('statusSpinner').style.display = 'none';
             clearQRCodeCheck();
-            showToast('该扫码会话已处理完成', 'info');
+            handleQRCodeSuccess(data);
             break;
         }
     }
@@ -11206,17 +11342,24 @@ function handleQRCodeSuccess(data) {
 
     // 添加真实cookie获取状态信息
     if (real_cookie_refreshed === true) {
-        if (token_prewarmed === false || task_restarted === false) {
-        successMessage += '\n✅ 真实Cookie已获取';
-        if (warning_message) {
-            successMessage += `\n⚠️ ${warning_message}`;
-        }
-        document.getElementById('statusText').textContent = '登录完成，但账号任务尚未切换';
-        showToast(successMessage, 'warning');
+        if (task_restarted === false) {
+            successMessage += '\n✅ 真实Cookie已获取';
+            if (warning_message) {
+                successMessage += `\n⚠️ ${warning_message}`;
+            }
+            document.getElementById('statusText').textContent = '登录完成，但账号任务尚未切换';
+            showToast(successMessage, 'warning');
+        } else if (token_prewarmed === false) {
+            successMessage += '\n✅ 真实Cookie获取并保存成功';
+            if (warning_message) {
+                successMessage += `\n⚠️ ${warning_message}`;
+            }
+            document.getElementById('statusText').textContent = '登录完成，账号任务已切换，Token将在后台继续初始化';
+            showToast(successMessage, 'warning');
         } else {
-        successMessage += '\n✅ 真实Cookie获取并保存成功';
-        document.getElementById('statusText').textContent = '登录成功！真实Cookie已获取并保存';
-        showToast(successMessage, 'success');
+            successMessage += '\n✅ 真实Cookie获取并保存成功';
+            document.getElementById('statusText').textContent = '登录成功！真实Cookie已获取并保存';
+            showToast(successMessage, 'success');
         }
     } else if (real_cookie_refreshed === false) {
         successMessage += '\n⚠️ 真实Cookie获取失败，已保存原始扫码Cookie';
@@ -11231,15 +11374,13 @@ function handleQRCodeSuccess(data) {
         showToast(successMessage, 'success');
     }
 
-    // 关闭模态框
-    setTimeout(() => {
-        const modal = bootstrap.Modal.getInstance(document.getElementById('qrCodeLoginModal'));
-        modal.hide();
-
-        // 刷新账号列表
-        loadCookies();
-    }, 3000); // 延长显示时间以便用户看到详细信息
+    closeQRCodeLoginModal(3000);
+    return;
     }
+
+    document.getElementById('statusText').textContent = '登录成功！';
+    showToast(data.message || '扫码登录已完成，账号信息已同步', 'success');
+    closeQRCodeLoginModal(1500);
 }
 
 // 清理二维码检查
@@ -14520,17 +14661,175 @@ async function downloadLogFile(fileName, buttonEl) {
 let currentRiskLogStatus = '';
 let currentRiskLogOffset = 0;
 const riskLogLimit = 100;
+let currentRiskSliderStatsRequestId = 0;
 
-async function fetchRiskControlLogsPage(token, { cookieId = '', processingStatus = '', limit = 100, offset = 0 } = {}) {
-    let url = `/admin/risk-control-logs?limit=${limit}&offset=${offset}`;
-    if (cookieId) {
-        url += `&cookie_id=${encodeURIComponent(cookieId)}`;
-    }
-    if (processingStatus) {
-        url += `&processing_status=${encodeURIComponent(processingStatus)}`;
+function setRiskControlSliderStatsLoading(scopeLabel = '全部账号') {
+    const scopeElement = document.getElementById('riskSliderScope');
+    const successRateElement = document.getElementById('riskSliderSuccessRate');
+    const attemptCountElement = document.getElementById('riskSliderAttemptCount');
+    const successCountElement = document.getElementById('riskSliderSuccessCount');
+    const failureCountElement = document.getElementById('riskSliderFailureCount');
+    const recentSuccessElement = document.getElementById('riskSliderRecentSuccess');
+    const recentFailureElement = document.getElementById('riskSliderRecentFailure');
+
+    if (scopeElement) scopeElement.textContent = scopeLabel;
+    if (successRateElement) successRateElement.textContent = '--';
+    if (attemptCountElement) attemptCountElement.textContent = '统计中...';
+    if (successCountElement) successCountElement.textContent = '--';
+    if (failureCountElement) failureCountElement.textContent = '--';
+    if (recentSuccessElement) recentSuccessElement.textContent = '--';
+    if (recentFailureElement) recentFailureElement.textContent = '--';
+}
+
+function renderRiskControlSliderStats(stats = {}) {
+    const scopeElement = document.getElementById('riskSliderScope');
+    const successRateElement = document.getElementById('riskSliderSuccessRate');
+    const attemptCountElement = document.getElementById('riskSliderAttemptCount');
+    const successCountElement = document.getElementById('riskSliderSuccessCount');
+    const failureCountElement = document.getElementById('riskSliderFailureCount');
+    const recentSuccessElement = document.getElementById('riskSliderRecentSuccess');
+    const recentFailureElement = document.getElementById('riskSliderRecentFailure');
+
+    const totalSessions = Number(stats.total_sessions ?? stats.total_attempts ?? 0);
+    const successCount = Number(stats.success_count || 0);
+    const failureCount = Number(stats.failure_count || 0);
+    const processingCount = Number(stats.processing_count || 0);
+    const completedSessions = Number(stats.completed_sessions || (successCount + failureCount));
+    const successRate = Number.isFinite(Number(stats.success_rate)) ? Number(stats.success_rate).toFixed(1) : '0.0';
+    const hasData = Boolean(stats.has_data || totalSessions > 0);
+    const recentSuccessText = formatBeijingDateTime(stats.recent_success);
+    const recentFailureText = formatBeijingDateTime(stats.recent_failure);
+    let attemptSummary = '暂无结构化滑块会话统计';
+
+    if (hasData) {
+        attemptSummary = `累计结构化会话 ${totalSessions} 次`;
+        if (processingCount > 0) {
+            attemptSummary += `，进行中 ${processingCount} 次`;
+        }
     }
 
-    const response = await fetch(url, {
+    if (scopeElement) scopeElement.textContent = stats.scope_label || '全部账号';
+    if (successRateElement) successRateElement.textContent = completedSessions > 0 ? `${successRate}%` : '--';
+    if (attemptCountElement) attemptCountElement.textContent = attemptSummary;
+    if (successCountElement) successCountElement.textContent = String(successCount);
+    if (failureCountElement) failureCountElement.textContent = String(failureCount);
+    if (recentSuccessElement) recentSuccessElement.textContent = recentSuccessText;
+    if (recentFailureElement) recentFailureElement.textContent = recentFailureText;
+}
+
+async function loadRiskControlSliderStats(cookieId = '') {
+    const token = localStorage.getItem('auth_token');
+    const scopeLabel = cookieId || '全部账号';
+    const requestId = ++currentRiskSliderStatsRequestId;
+
+    setRiskControlSliderStatsLoading(scopeLabel);
+
+    try {
+        let url = '/admin/slider-verification-stats';
+        if (cookieId) {
+            url += `?cookie_id=${encodeURIComponent(cookieId)}`;
+        }
+
+        const response = await fetch(url, {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            }
+        });
+
+        const data = await response.json();
+        if (requestId !== currentRiskSliderStatsRequestId) {
+            return;
+        }
+
+        if (response.ok && data.success) {
+            renderRiskControlSliderStats(data.data || {});
+            return;
+        }
+
+        renderRiskControlSliderStats({
+            scope_label: scopeLabel,
+            total_sessions: 0,
+            success_count: 0,
+            failure_count: 0,
+            processing_count: 0,
+            completed_sessions: 0,
+            success_rate: 0,
+            recent_success: '--',
+            recent_failure: '--',
+            has_data: false
+        });
+    } catch (error) {
+        console.error('加载滑块验证统计失败:', error);
+        if (requestId !== currentRiskSliderStatsRequestId) {
+            return;
+        }
+        renderRiskControlSliderStats({
+            scope_label: scopeLabel,
+            total_sessions: 0,
+            success_count: 0,
+            failure_count: 0,
+            processing_count: 0,
+            completed_sessions: 0,
+            success_rate: 0,
+            recent_success: '--',
+            recent_failure: '--',
+            has_data: false
+        });
+    }
+}
+
+function getRiskLogFilters() {
+    return {
+        cookieId: document.getElementById('riskLogCookieFilter')?.value || '',
+        eventType: document.getElementById('riskLogEventTypeFilter')?.value || '',
+        triggerScene: document.getElementById('riskLogTriggerSceneFilter')?.value || '',
+        dateFrom: document.getElementById('riskLogDateFrom')?.value || '',
+        dateTo: document.getElementById('riskLogDateTo')?.value || '',
+        sessionId: (document.getElementById('riskLogSessionFilter')?.value || '').trim(),
+        processingStatus: currentRiskLogStatus,
+        limit: parseInt(document.getElementById('riskLogLimit')?.value, 10) || 100,
+    };
+}
+
+function hasActiveRiskLogFilters(filters = {}) {
+    return Boolean(
+        filters.cookieId ||
+        filters.processingStatus ||
+        filters.eventType ||
+        filters.triggerScene ||
+        filters.dateFrom ||
+        filters.dateTo ||
+        filters.sessionId
+    );
+}
+
+async function fetchRiskControlLogsPage(token, {
+    cookieId = '',
+    processingStatus = '',
+    eventType = '',
+    triggerScene = '',
+    dateFrom = '',
+    dateTo = '',
+    sessionId = '',
+    resultCode = '',
+    limit = 100,
+    offset = 0,
+} = {}) {
+    const params = new URLSearchParams({
+        limit: String(limit),
+        offset: String(offset),
+    });
+
+    if (cookieId) params.set('cookie_id', cookieId);
+    if (processingStatus) params.set('processing_status', processingStatus);
+    if (eventType) params.set('event_type', eventType);
+    if (triggerScene) params.set('trigger_scene', triggerScene);
+    if (dateFrom) params.set('date_from', dateFrom);
+    if (dateTo) params.set('date_to', dateTo);
+    if (sessionId) params.set('session_id', sessionId);
+    if (resultCode) params.set('result_code', resultCode);
+
+    const response = await fetch(`/admin/risk-control-logs?${params.toString()}`, {
         headers: {
             'Authorization': `Bearer ${token}`
         }
@@ -14547,7 +14846,18 @@ function needsClientSideRiskLogFilter(logs, processingStatus) {
     return logs.some(log => String(log.processing_status || '') !== processingStatus);
 }
 
-async function fetchRiskControlLogsWithClientFilter(token, { cookieId = '', processingStatus = '', limit = 100, offset = 0 } = {}) {
+async function fetchRiskControlLogsWithClientFilter(token, {
+    cookieId = '',
+    processingStatus = '',
+    eventType = '',
+    triggerScene = '',
+    dateFrom = '',
+    dateTo = '',
+    sessionId = '',
+    resultCode = '',
+    limit = 100,
+    offset = 0,
+} = {}) {
     const batchSize = 500;
     let fetchOffset = 0;
     let total = 0;
@@ -14556,6 +14866,12 @@ async function fetchRiskControlLogsWithClientFilter(token, { cookieId = '', proc
     while (true) {
         const pageData = await fetchRiskControlLogsPage(token, {
             cookieId,
+            eventType,
+            triggerScene,
+            dateFrom,
+            dateTo,
+            sessionId,
+            resultCode,
             limit: batchSize,
             offset: fetchOffset
         });
@@ -14584,9 +14900,12 @@ async function fetchRiskControlLogsWithClientFilter(token, { cookieId = '', proc
 // 加载风控日志
 async function loadRiskControlLogs(offset = 0) {
     const token = localStorage.getItem('auth_token');
-    const cookieId = document.getElementById('riskLogCookieFilter').value;
-    const limit = parseInt(document.getElementById('riskLogLimit').value, 10) || 100;
+    const filters = getRiskLogFilters();
+    const cookieId = filters.cookieId;
+    const limit = filters.limit;
     currentRiskLogOffset = offset;
+
+    loadRiskControlSliderStats(cookieId);
 
     const loadingDiv = document.getElementById('loadingRiskLogs');
     const logContainer = document.getElementById('riskLogContainer');
@@ -14598,18 +14917,14 @@ async function loadRiskControlLogs(offset = 0) {
 
     try {
         let data = await fetchRiskControlLogsPage(token, {
-            cookieId,
-            processingStatus: currentRiskLogStatus,
-            limit,
-            offset
+            ...filters,
+            offset,
         });
 
-        if (needsClientSideRiskLogFilter(data.data, currentRiskLogStatus)) {
+        if (needsClientSideRiskLogFilter(data.data, filters.processingStatus)) {
             data = await fetchRiskControlLogsWithClientFilter(token, {
-                cookieId,
-                processingStatus: currentRiskLogStatus,
-                limit,
-                offset
+                ...filters,
+                offset,
             });
         }
 
@@ -14644,6 +14959,138 @@ async function loadRiskControlLogs(offset = 0) {
 }
 
 // 显示风控日志
+function getRiskEventCategoryMeta(eventType) {
+    const normalizedType = String(eventType || '').trim();
+
+    if (['slider_captcha', 'face_verify', 'sms_verify', 'qr_verify', 'token_expired'].includes(normalizedType)) {
+        return {
+            label: '风控触发',
+            className: 'risk-event-category-trigger'
+        };
+    }
+
+    if (normalizedType === 'cookie_refresh') {
+        return {
+            label: 'Cookie刷新',
+            className: 'risk-event-category-refresh'
+        };
+    }
+
+    if (normalizedType === 'password_error') {
+        return {
+            label: '登录异常',
+            className: 'risk-event-category-error'
+        };
+    }
+
+    return {
+        label: normalizedType || '-',
+        className: 'risk-event-category-neutral'
+    };
+}
+
+function getRiskTriggerSceneLabel(triggerScene) {
+    const normalizedScene = String(triggerScene || '').trim();
+    const sceneLabels = {
+        token_refresh: 'Token刷新',
+        auto_cookie_refresh: '自动Cookie刷新',
+        manual_password_refresh: '手动账密刷新',
+        manual_qr_refresh: '手动扫码刷新',
+        password_login: '密码登录',
+        qr_login: '扫码登录'
+    };
+
+    return sceneLabels[normalizedScene] || normalizedScene || '-';
+}
+
+function formatRiskDuration(durationMs) {
+    const value = Number(durationMs);
+    if (!Number.isFinite(value) || value <= 0) {
+        return '--';
+    }
+    if (value < 1000) {
+        return `${Math.round(value)} ms`;
+    }
+    if (value < 60000) {
+        return `${(value / 1000).toFixed(1)} s`;
+    }
+    return `${(value / 60000).toFixed(1)} min`;
+}
+
+function formatRiskSessionId(sessionId, sessionDisplay = '') {
+    const text = String(sessionId || '').trim();
+    if (text) {
+        return text;
+    }
+    const fallback = String(sessionDisplay || '').trim();
+    return fallback || '--';
+}
+
+function normalizeRiskEventMeta(eventMeta) {
+    if (!eventMeta) {
+        return null;
+    }
+    if (typeof eventMeta === 'string') {
+        try {
+            return JSON.parse(eventMeta);
+        } catch (error) {
+            return { raw: eventMeta };
+        }
+    }
+    if (typeof eventMeta === 'object') {
+        return eventMeta;
+    }
+    return { raw: String(eventMeta) };
+}
+
+function renderRiskLogMetaDetails(eventMeta) {
+    const normalizedMeta = normalizeRiskEventMeta(eventMeta);
+    if (!normalizedMeta) {
+        return '';
+    }
+    const prettyJson = JSON.stringify(normalizedMeta, null, 2);
+    return `
+        <details class="mt-2">
+            <summary class="small text-muted">查看元数据</summary>
+            <pre class="small mb-0 mt-2">${escapeHtml(prettyJson)}</pre>
+        </details>
+    `;
+}
+
+function renderRiskLogSummaryCell(log) {
+    const descriptionText = log.event_description_display || log.event_description || '-';
+    const description = escapeHtml(descriptionText);
+    const resultCode = log.result_code
+        ? `<div class="small text-muted mt-1">结果代码: ${escapeHtml(log.result_code)}</div>`
+        : '';
+    return `
+        <div class="risk-log-summary-cell" title="${description}">${description}</div>
+        ${resultCode}
+    `;
+}
+
+function renderRiskLogOutcomeCell(log) {
+    const processingResultText = log.processing_result_display || log.processing_result || '';
+    const errorMessageText = log.error_message_display || log.error_message || '';
+    const processingResult = processingResultText
+        ? `<div class="text-wrap">${escapeHtml(processingResultText)}</div>`
+        : '';
+    const errorMessage = errorMessageText
+        ? `<div class="small text-danger mt-1">${escapeHtml(errorMessageText)}</div>`
+        : '';
+    const fallbackText = !processingResult && !errorMessage
+        ? '<span class="text-muted">-</span>'
+        : '';
+    return `
+        <div class="risk-log-outcome-cell">
+            ${processingResult}
+            ${errorMessage}
+            ${fallbackText}
+            ${renderRiskLogMetaDetails(log.event_meta)}
+        </div>
+    `;
+}
+
 function displayRiskControlLogs(logs) {
     const tableBody = document.getElementById('riskLogTableBody');
     tableBody.innerHTML = '';
@@ -14670,25 +15117,35 @@ function displayRiskControlLogs(logs) {
                 statusBadge = '<span class="badge bg-secondary">未知</span>';
         }
 
-        // 事件类型映射
-        const eventTypeMap = {
-            'slider_captcha': '滑块验证',
-            'face_verify': '人脸验证',
-            'sms_verify': '短信验证',
-            'qr_verify': '二维码验证',
-            'password_error': '账密错误',
-            'token_expired': '令牌过期',
-            'cookie_refresh': 'Cookie刷新'
-        };
-        const eventTypeName = eventTypeMap[log.event_type] || log.event_type || '-';
+        const eventCategory = getRiskEventCategoryMeta(log.event_type);
+        const eventCategoryBadge = `
+            <span
+                class="badge risk-event-category-badge ${eventCategory.className}"
+                title="原始类型: ${escapeHtml(log.event_type || '-')}"
+            >
+                ${escapeHtml(eventCategory.label)}
+            </span>
+        `;
+        const triggerSceneLabel = getRiskTriggerSceneLabel(log.trigger_scene);
+        const triggerSceneBadge = `
+            <span class="badge bg-light text-dark border" title="触发场景: ${escapeHtml(log.trigger_scene || '-')}">
+                ${escapeHtml(triggerSceneLabel)}
+            </span>
+        `;
+        const sessionIdDisplay = formatRiskSessionId(log.session_id, log.session_display);
+        const sessionTitle = escapeHtml(log.session_id || log.session_display || '-');
+        const durationText = formatRiskDuration(log.duration_ms);
 
         row.innerHTML = `
             <td class="text-nowrap">${createdAt}</td>
             <td class="text-nowrap">${escapeHtml(log.cookie_id || '-')}</td>
-            <td class="text-nowrap">${escapeHtml(eventTypeName)}</td>
+            <td class="text-nowrap">${eventCategoryBadge}</td>
+            <td class="text-nowrap">${triggerSceneBadge}</td>
             <td>${statusBadge}</td>
-            <td class="text-truncate" style="max-width: 200px;" title="${escapeHtml(log.event_description || '-')}">${escapeHtml(log.event_description || '-')}</td>
-            <td class="text-truncate" style="max-width: 200px;" title="${escapeHtml(log.processing_result || '-')}">${escapeHtml(log.processing_result || '-')}</td>
+            <td class="risk-log-cell-summary">${renderRiskLogSummaryCell(log)}</td>
+            <td class="risk-log-cell-outcome">${renderRiskLogOutcomeCell(log)}</td>
+            <td class="text-nowrap">${escapeHtml(durationText)}</td>
+            <td class="risk-log-cell-session" title="${sessionTitle}">${escapeHtml(sessionIdDisplay)}</td>
             <td>
                 <button class="btn btn-sm btn-outline-danger" onclick="deleteRiskControlLog(${log.id})" title="删除">
                     <i class="bi bi-trash"></i>
@@ -14704,8 +15161,7 @@ function displayRiskControlLogs(logs) {
 function updateRiskLogInfo(data) {
     const countElement = document.getElementById('riskLogCount');
     const paginationInfo = document.getElementById('riskLogPaginationInfo');
-    const cookieId = document.getElementById('riskLogCookieFilter')?.value;
-    const hasFilters = Boolean(cookieId || currentRiskLogStatus);
+    const hasFilters = hasActiveRiskLogFilters(getRiskLogFilters());
     const total = data.total || 0;
     const currentCount = data.data ? data.data.length : 0;
 
@@ -15353,13 +15809,10 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.7.5';
+const DEFAULT_VERSION = 'v1.8.0';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
-
-// 远程版本检查API地址（暂时禁用）
-// const VERSION_CHECK_URL = 'http://116.196.116.76/version.php';
 
 // 缓存远程版本信息
 let remoteVersionInfo = null;
@@ -15467,9 +15920,22 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.7.5',
+    version: 'v1.8.0',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.8.0',
+            date: '2026-04-01',
+            updates: [
+                '【新功能】风控日志升级为结构化会话链路，覆盖滑块验证、Token 过期、账密登录和扫码刷新，支持统一追踪结果、场景与脱敏元数据',
+                '【优化】风控看板重构为结构化会话统计，新增更准确的滑块成功/失败会话统计、筛选能力与响应式详情展示，排查风控更直观',
+                '【优化】滑块验证反检测全面增强，加入稳定指纹配置、拟人轨迹、Cookie 预热与多轮重试策略，提升验证通过率与稳定性',
+                '【修复】手动刷新、扫码登录与密码登录流程增加互斥保护、失败退避和状态收口，减少刷新互踩、扫码回滚误判与登录风控残留',
+                '【修复】扫码/密码登录链路补强浏览器侧 Cookie 稳定化、前置登录态校验和人脸/滑块兜底判断，登录成功判定更可靠',
+                '【优化】图片上传新增错误类型追踪，调用方可按错误原因给出更准确的提示与处理',
+                '【修复】商品管理区分“同步商品”和“刷新列表”，同步指定页/所有页时会强制拉取已有商品的最新详情，避免本地缓存长期陈旧'
+            ]
+        },
         {
             version: 'v1.7.5',
             date: '2026-03-24',

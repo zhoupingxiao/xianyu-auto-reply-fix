@@ -2453,7 +2453,26 @@ def update_cookie_proxy_config(cid: str, config: ProxyConfig, current_user: Dict
 
 # ========================= 账号密码登录相关接口 =========================
 
-def _update_session_risk_log(session_id: str, status: str, processing_result: str = None, error_message: str = None):
+def _new_risk_log_session_id(prefix: str = 'risk') -> str:
+    return f"{prefix}_{secrets.token_hex(8)}"
+
+
+def _build_risk_event_meta(base: Optional[Dict[str, Any]] = None, **extra_fields) -> Optional[Dict[str, Any]]:
+    payload: Dict[str, Any] = {}
+    if isinstance(base, dict):
+        payload.update({key: value for key, value in base.items() if value is not None})
+    payload.update({key: value for key, value in extra_fields.items() if value is not None})
+    return payload or None
+
+
+def _update_session_risk_log(
+    session_id: str,
+    status: str,
+    processing_result: str = None,
+    error_message: str = None,
+    result_code: str = None,
+    event_meta: Optional[Dict[str, Any]] = None,
+):
     """更新登录会话关联的风控日志状态"""
     try:
         session = password_login_sessions.get(session_id)
@@ -2462,19 +2481,95 @@ def _update_session_risk_log(session_id: str, status: str, processing_result: st
         log_id = session.get('risk_control_log_id')
         if not log_id:
             return
+
+        risk_session_id = session.get('risk_session_id') or session_id
+        duration_ms = None
+        started_at = session.get('timestamp')
+        if started_at:
+            duration_ms = max(0, int((time.time() - float(started_at)) * 1000))
+
+        if not result_code:
+            refresh_mode = bool(session.get('refresh_mode'))
+            if status == 'success':
+                result_code = 'manual_cookie_refresh_success' if refresh_mode else 'password_login_success'
+            elif status == 'failed':
+                result_code = 'manual_cookie_refresh_failed' if refresh_mode else 'password_login_failed'
+
+        merged_meta = _build_risk_event_meta(
+            {
+                'account_id': session.get('account_id'),
+                'show_browser': session.get('show_browser'),
+                'refresh_mode': bool(session.get('refresh_mode')),
+            },
+            **(event_meta or {}),
+        )
+
         db_manager.update_risk_control_log(
             log_id=log_id,
+            session_id=risk_session_id,
             processing_status=status,
             processing_result=processing_result,
-            error_message=error_message
+            error_message=error_message,
+            result_code=result_code,
+            event_meta=merged_meta,
+            duration_ms=duration_ms,
         )
     except Exception as e:
         logger.error(f"更新风控日志状态失败: {e}")
 
+
+def _set_password_login_session_status(session_id: str, status: str, **fields):
+    session = password_login_sessions.get(session_id)
+    if not session:
+        return
+
+    session['status'] = status
+    session.update(fields)
+
+    if status in {'success', 'failed'}:
+        session['completed_at'] = time.time()
+    else:
+        session['completed_at'] = None
+
+
+def _empty_slider_session_stats() -> Dict[str, Any]:
+    return {
+        'has_data': False,
+        'total_sessions': 0,
+        'total_attempts': 0,
+        'success_count': 0,
+        'failure_count': 0,
+        'processing_count': 0,
+        'completed_sessions': 0,
+        'success_rate': 0.0,
+        'recent_success': None,
+        'recent_failure': None,
+        'accounts_with_sessions': 0,
+        'stats_mode': 'session',
+    }
+
 async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, show_browser: bool, user_id: int, current_user: Dict[str, Any]):
     """后台执行账号密码登录任务"""
+    manual_refresh_acquired = False
+    manual_refresh_owner = f"password_login:{session_id}"
+    login_thread_started = False
     try:
         log_with_user('info', f"开始执行账号密码登录任务: {session_id}, 账号: {account_id}", current_user)
+
+        is_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', False)
+        if is_refresh_mode:
+            from XianyuAutoAsync import XianyuLive
+            manual_refresh_state = XianyuLive.begin_manual_refresh(account_id, source=manual_refresh_owner)
+            manual_refresh_acquired = manual_refresh_state.get('started', False)
+            if manual_refresh_state.get('already_active'):
+                _set_password_login_session_status(
+                    session_id,
+                    'failed',
+                    error='该账号正在执行手动刷新，请稍候再试'
+                )
+                _update_session_risk_log(session_id, 'failed', error_message='账号正在执行手动刷新')
+                log_with_user('warning', f"账号已存在手动刷新任务，拒绝重复触发: {account_id}", current_user)
+                return
         
         # 导入 XianyuSliderStealth
         from utils.xianyu_slider_stealth import XianyuSliderStealth
@@ -2487,6 +2582,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             enable_learning=True,
             headless=not show_browser
         )
+        slider_instance.risk_session_id = password_login_sessions.get(session_id, {}).get('risk_session_id') or session_id
+        slider_instance.risk_trigger_scene = 'manual_password_refresh' if is_refresh_mode else 'password_login'
         
         # 更新会话信息
         password_login_sessions[session_id]['slider_instance'] = slider_instance
@@ -2508,10 +2605,13 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 # 优先使用截图路径，如果没有截图则使用验证链接
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
                     # 更新会话状态，保存截图路径
-                    password_login_sessions[session_id]['status'] = 'verification_required'
-                    password_login_sessions[session_id]['screenshot_path'] = actual_screenshot_path
-                    password_login_sessions[session_id]['verification_url'] = None
-                    password_login_sessions[session_id]['qr_code_url'] = None
+                    _set_password_login_session_status(
+                        session_id,
+                        'verification_required',
+                        screenshot_path=actual_screenshot_path,
+                        verification_url=None,
+                        qr_code_url=None
+                    )
                     log_with_user('info', f"人脸认证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
                     
                     # 发送通知到用户配置的渠道
@@ -2571,10 +2671,13 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     log_with_user('info', f"已启动人脸验证通知发送线程: {account_id}", current_user)
                 elif verification_url:
                     # 如果没有截图，使用验证链接（兼容旧版本）
-                    password_login_sessions[session_id]['status'] = 'verification_required'
-                    password_login_sessions[session_id]['verification_url'] = verification_url
-                    password_login_sessions[session_id]['screenshot_path'] = None
-                    password_login_sessions[session_id]['qr_code_url'] = None
+                    _set_password_login_session_status(
+                        session_id,
+                        'verification_required',
+                        verification_url=verification_url,
+                        screenshot_path=None,
+                        qr_code_url=None
+                    )
                     log_with_user('info', f"人脸认证验证链接已保存: {session_id}, URL: {verification_url}", current_user)
                     
                     # 发送通知到用户配置的渠道
@@ -2644,15 +2747,16 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     account=account,
                     password=password,
                     show_browser=show_browser,
-                    notification_callback=notification_callback
+                    notification_callback=notification_callback,
+                    force_clean_context=is_refresh_mode
                 )
                 
                 if cookies_dict is None:
-                    password_login_sessions[session_id]['status'] = 'failed'
-                    password_login_sessions[session_id]['error'] = '登录失败，请检查账号密码是否正确'
-                    log_with_user('error', f"账号密码登录失败: {account_id}", current_user)
+                    failure_message = slider_instance.last_login_error or '登录失败，请检查账号密码是否正确'
+                    _set_password_login_session_status(session_id, 'failed', error=failure_message)
+                    log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {failure_message}", current_user)
                     # 更新风控日志状态
-                    _update_session_risk_log(session_id, 'failed', error_message='登录失败，账号密码可能错误')
+                    _update_session_risk_log(session_id, 'failed', error_message=failure_message[:200])
                     return
                 
                 # 将cookie字典转换为字符串格式
@@ -2667,7 +2771,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 # 保存账号密码和Cookie到数据库
                 # 使用 update_cookie_account_info 来保存，它会自动处理新账号和现有账号的情况
                 # 注意：刷新模式下不更新 show_browser，避免临时调试选项被永久保存
-                is_refresh_mode = password_login_sessions.get(session_id, {}).get('refresh_mode', False)
                 update_success = db_manager.update_cookie_account_info(
                     account_id,
                     cookie_value=cookies_str,
@@ -2689,108 +2792,121 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 # 账号密码已经在上面通过update_cookie_account_info保存了
                 # 这里只需要更新内存中的cookie值，不保存到数据库（避免覆盖账号密码）
                 if cookie_manager.manager:
-                    # 更新内存中的cookie值
-                    cookie_manager.manager.cookies[account_id] = cookies_str
-                    log_with_user('info', f"已更新cookie_manager中的Cookie（内存）: {account_id}", current_user)
-                    
-                    # 如果是新账号，需要启动任务
-                    if is_new_account:
-                        # 使用异步方式启动任务，但不保存到数据库（避免覆盖账号密码）
+                    if is_refresh_mode and not is_new_account:
                         try:
-                            import asyncio
-                            loop = cookie_manager.manager.loop
-                            if loop:
-                                # 确保关键词列表存在
-                                if account_id not in cookie_manager.manager.keywords:
-                                    cookie_manager.manager.keywords[account_id] = []
-                                
-                                # 在后台启动任务（使用线程安全的方式，因为run_login是在后台线程中运行的）
-                                try:
-                                    # 尝试使用run_coroutine_threadsafe，这是线程安全的方式
-                                    fut = asyncio.run_coroutine_threadsafe(
-                                        cookie_manager.manager._run_xianyu(account_id, cookies_str, user_id),
-                                        loop
-                                    )
-                                    # 不等待结果，让它在后台运行
-                                    log_with_user('info', f"已启动新账号任务: {account_id}", current_user)
-                                except RuntimeError as e:
-                                    # 如果事件循环未运行，记录警告但不影响登录成功
-                                    log_with_user('warning', f"事件循环未运行，无法启动新账号任务: {account_id}, 错误: {str(e)}", current_user)
-                                    log_with_user('info', f"账号已保存，将在系统重启后自动启动任务: {account_id}", current_user)
-                        except Exception as task_err:
-                            log_with_user('warning', f"启动新账号任务失败: {account_id}, 错误: {str(task_err)}", current_user)
-                            import traceback
-                            logger.error(traceback.format_exc())
-                
-                # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
-                try:
-                    log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                    from XianyuAutoAsync import XianyuLive
-                    
-                    # 创建临时的XianyuLive实例来刷新Cookie
-                    temp_xianyu = XianyuLive(
-                        cookies_str=cookies_str,
-                        cookie_id=account_id,
-                        user_id=user_id
-                    )
-                    
-                    # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
-                    try:
-                        temp_xianyu.reset_qr_cookie_refresh_flag()
-                        log_with_user('info', f"已重置扫码登录Cookie刷新标志: {account_id}", current_user)
-                    except Exception as reset_err:
-                        log_with_user('debug', f"重置扫码登录Cookie刷新标志失败（不影响刷新）: {str(reset_err)}", current_user)
-                    
-                    # 在后台异步执行刷新（不阻塞主流程）
-                    async def refresh_cookies_task():
-                        try:
-                            refresh_success = await temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False)
-                            if refresh_success:
-                                log_with_user('info', f"Cookie刷新成功: {account_id}", current_user)
-                                # 刷新成功后，从数据库获取更新后的Cookie
-                                updated_cookie_info = db_manager.get_cookie_details(account_id)
-                                if updated_cookie_info:
-                                    refreshed_cookies = updated_cookie_info.get('value', '')
-                                    if refreshed_cookies:
-                                        # 更新cookie_manager中的Cookie
-                                        if cookie_manager.manager:
-                                            cookie_manager.manager.update_cookie(account_id, refreshed_cookies, save_to_db=False)
-                                        log_with_user('info', f"已更新刷新后的Cookie到cookie_manager: {account_id}", current_user)
-                            else:
-                                log_with_user('warning', f"Cookie刷新失败或跳过: {account_id}", current_user)
-                        except Exception as refresh_e:
-                            log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
-                            import traceback
-                            logger.error(traceback.format_exc())
-                    
-                    # 在后台线程中运行异步任务
-                    # 由于run_login是在线程中运行的，需要创建新的事件循环
-                    def run_async_refresh():
-                        try:
-                            import asyncio
-                            # 创建新的事件循环
-                            new_loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(new_loop)
+                            cookie_manager.manager.update_cookie(account_id, cookies_str, save_to_db=False)
+                            log_with_user('info', f"刷新模式已更新cookie_manager并重启任务: {account_id}", current_user)
+                        except Exception as manager_err:
+                            log_with_user('warning', f"刷新模式更新cookie_manager失败: {account_id}, 错误: {str(manager_err)}", current_user)
+                    else:
+                        # 更新内存中的cookie值
+                        cookie_manager.manager.cookies[account_id] = cookies_str
+                        log_with_user('info', f"已更新cookie_manager中的Cookie（内存）: {account_id}", current_user)
+                        
+                        # 如果是新账号，需要启动任务
+                        if is_new_account:
+                            # 使用异步方式启动任务，但不保存到数据库（避免覆盖账号密码）
                             try:
-                                new_loop.run_until_complete(refresh_cookies_task())
-                            finally:
-                                new_loop.close()
-                        except Exception as e:
-                            log_with_user('error', f"运行异步刷新任务失败: {account_id}, 错误: {str(e)}", current_user)
-                    
-                    # 在后台线程中执行刷新任务
-                    refresh_thread = threading.Thread(target=run_async_refresh, daemon=True)
-                    refresh_thread.start()
-                    
-                except Exception as refresh_err:
-                    log_with_user('warning', f"调用_refresh_cookies_via_browser失败: {account_id}, 错误: {str(refresh_err)}", current_user)
-                    # 刷新失败不影响登录成功
+                                import asyncio
+                                loop = cookie_manager.manager.loop
+                                if loop:
+                                    # 确保关键词列表存在
+                                    if account_id not in cookie_manager.manager.keywords:
+                                        cookie_manager.manager.keywords[account_id] = []
+                                    
+                                    # 在后台启动任务（使用线程安全的方式，因为run_login是在后台线程中运行的）
+                                    try:
+                                        # 尝试使用run_coroutine_threadsafe，这是线程安全的方式
+                                        fut = asyncio.run_coroutine_threadsafe(
+                                            cookie_manager.manager._run_xianyu(account_id, cookies_str, user_id),
+                                            loop
+                                        )
+                                        # 不等待结果，让它在后台运行
+                                        log_with_user('info', f"已启动新账号任务: {account_id}", current_user)
+                                    except RuntimeError as e:
+                                        # 如果事件循环未运行，记录警告但不影响登录成功
+                                        log_with_user('warning', f"事件循环未运行，无法启动新账号任务: {account_id}, 错误: {str(e)}", current_user)
+                                        log_with_user('info', f"账号已保存，将在系统重启后自动启动任务: {account_id}", current_user)
+                            except Exception as task_err:
+                                log_with_user('warning', f"启动新账号任务失败: {account_id}, 错误: {str(task_err)}", current_user)
+                                import traceback
+                                logger.error(traceback.format_exc())
+                
+                if is_refresh_mode:
+                    log_with_user('info', f"刷新模式跳过额外浏览器Cookie刷新，直接使用当前登录结果: {account_id}", current_user)
+                else:
+                    # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
+                    try:
+                        log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
+                        from XianyuAutoAsync import XianyuLive
+                        
+                        # 创建临时的XianyuLive实例来刷新Cookie
+                        temp_xianyu = XianyuLive(
+                            cookies_str=cookies_str,
+                            cookie_id=account_id,
+                            user_id=user_id
+                        )
+                        
+                        # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
+                        try:
+                            temp_xianyu.reset_qr_cookie_refresh_flag()
+                            log_with_user('info', f"已重置扫码登录Cookie刷新标志: {account_id}", current_user)
+                        except Exception as reset_err:
+                            log_with_user('debug', f"重置扫码登录Cookie刷新标志失败（不影响刷新）: {str(reset_err)}", current_user)
+                        
+                        # 在后台异步执行刷新（不阻塞主流程）
+                        async def refresh_cookies_task():
+                            try:
+                                refresh_success = await temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False)
+                                if refresh_success:
+                                    log_with_user('info', f"Cookie刷新成功: {account_id}", current_user)
+                                    # 刷新成功后，从数据库获取更新后的Cookie
+                                    updated_cookie_info = db_manager.get_cookie_details(account_id)
+                                    if updated_cookie_info:
+                                        refreshed_cookies = updated_cookie_info.get('value', '')
+                                        if refreshed_cookies:
+                                            # 更新cookie_manager中的Cookie
+                                            if cookie_manager.manager:
+                                                cookie_manager.manager.update_cookie(account_id, refreshed_cookies, save_to_db=False)
+                                            log_with_user('info', f"已更新刷新后的Cookie到cookie_manager: {account_id}", current_user)
+                                else:
+                                    log_with_user('warning', f"Cookie刷新失败或跳过: {account_id}", current_user)
+                            except Exception as refresh_e:
+                                log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
+                                import traceback
+                                logger.error(traceback.format_exc())
+                        
+                        # 在后台线程中运行异步任务
+                        # 由于run_login是在线程中运行的，需要创建新的事件循环
+                        def run_async_refresh():
+                            try:
+                                import asyncio
+                                # 创建新的事件循环
+                                new_loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(new_loop)
+                                try:
+                                    new_loop.run_until_complete(refresh_cookies_task())
+                                finally:
+                                    new_loop.close()
+                            except Exception as e:
+                                log_with_user('error', f"运行异步刷新任务失败: {account_id}, 错误: {str(e)}", current_user)
+                        
+                        # 在后台线程中执行刷新任务
+                        refresh_thread = threading.Thread(target=run_async_refresh, daemon=True)
+                        refresh_thread.start()
+                        
+                    except Exception as refresh_err:
+                        log_with_user('warning', f"调用_refresh_cookies_via_browser失败: {account_id}, 错误: {str(refresh_err)}", current_user)
+                        # 刷新失败不影响登录成功
                 
                 # 更新会话状态
-                password_login_sessions[session_id]['status'] = 'success'
-                password_login_sessions[session_id]['account_id'] = account_id
-                password_login_sessions[session_id]['is_new_account'] = is_new_account
-                password_login_sessions[session_id]['cookie_count'] = len(cookies_dict)
+                _set_password_login_session_status(
+                    session_id,
+                    'success',
+                    account_id=account_id,
+                    is_new_account=is_new_account,
+                    cookie_count=len(cookies_dict)
+                )
                 # 更新风控日志状态
                 _update_session_risk_log(session_id, 'success', processing_result='Cookie刷新成功')
 
@@ -2800,15 +2916,15 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     from db_manager import db_manager
 
                     # 根据模式选择不同模板
-                    is_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
-                    template_type = 'cookie_refresh_success' if is_refresh_mode else 'password_login_success'
+                    notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
+                    template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
 
                     # 获取模板
                     template_data = db_manager.get_notification_template(template_type)
                     if template_data and template_data.get('template'):
                         template = template_data['template']
                     else:
-                        if is_refresh_mode:
+                        if notify_refresh_mode:
                             template = '''✅ 刷新Cookie成功
 
 账号: {account_id}
@@ -2830,7 +2946,7 @@ Cookie数量: {cookie_count}
                     notification_message = notification_message.replace('{time}', time.strftime('%Y-%m-%d %H:%M:%S'))
                     notification_message = notification_message.replace('{cookie_count}', str(len(cookies_dict)))
 
-                    login_type = "刷新Cookie" if is_refresh_mode else "密码登录"
+                    login_type = "刷新Cookie" if notify_refresh_mode else "密码登录"
                     notification_title = f"🎉 {login_type}成功"
 
                     send_notification(account_id, notification_title, notification_message, "success")
@@ -2840,8 +2956,7 @@ Cookie数量: {cookie_count}
                 
             except Exception as e:
                 error_msg = str(e)
-                password_login_sessions[session_id]['status'] = 'failed'
-                password_login_sessions[session_id]['error'] = error_msg
+                _set_password_login_session_status(session_id, 'failed', error=error_msg)
                 log_with_user('error', f"账号密码登录失败: {account_id}, 错误: {error_msg}", current_user)
                 logger.info(f"会话 {session_id} 状态已更新为 failed，错误消息: {error_msg}")  # 添加日志确认状态更新
                 # 更新风控日志状态
@@ -2856,16 +2971,30 @@ Cookie数量: {cookie_count}
                     log_with_user('debug', f"已释放并发槽位: {account_id}", current_user)
                 except Exception as cleanup_e:
                     log_with_user('warning', f"清理实例时出错: {str(cleanup_e)}", current_user)
+
+                if manual_refresh_acquired:
+                    try:
+                        from XianyuAutoAsync import XianyuLive
+                        XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
+                        log_with_user('info', f"已结束手动刷新保护: {account_id}", current_user)
+                    except Exception as manual_cleanup_e:
+                        log_with_user('warning', f"结束手动刷新保护失败: {account_id}, 错误: {str(manual_cleanup_e)}", current_user)
         
         # 在后台线程中执行登录
         login_thread = threading.Thread(target=run_login, daemon=True)
         login_thread.start()
+        login_thread_started = True
         
     except Exception as e:
-        password_login_sessions[session_id]['status'] = 'failed'
-        password_login_sessions[session_id]['error'] = str(e)
+        _set_password_login_session_status(session_id, 'failed', error=str(e))
         log_with_user('error', f"执行账号密码登录任务异常: {str(e)}", current_user)
         _update_session_risk_log(session_id, 'failed', error_message=str(e)[:200])
+        if manual_refresh_acquired and not login_thread_started:
+            try:
+                from XianyuAutoAsync import XianyuLive
+                XianyuLive.end_manual_refresh(account_id, source=manual_refresh_owner)
+            except Exception:
+                pass
         import traceback
         logger.error(traceback.format_exc())
 
@@ -2890,6 +3019,7 @@ async def password_login(
 
         # 刷新模式：从数据库读取已保存的账号密码
         if refresh_mode and account_id:
+            from XianyuAutoAsync import XianyuLive
             cookie_info = db_manager.get_cookie_details(account_id)
             if not cookie_info:
                 return {'success': False, 'message': f'未找到账号: {account_id}'}
@@ -2910,17 +3040,8 @@ async def password_login(
 
             log_with_user('info', f"刷新Cookie模式: {account_id}, 用户名: {account}, show_browser: {show_browser}", current_user)
 
-            # 记录手动刷新Cookie到风控日志
-            try:
-                risk_log_id = db_manager.add_risk_control_log(
-                    cookie_id=account_id,
-                    event_type='cookie_refresh',
-                    event_description=f"手动触发Cookie刷新（账密登录方式）",
-                    processing_status='processing'
-                )
-            except Exception as log_e:
-                risk_log_id = None
-                logger.error(f"记录风控日志失败: {log_e}")
+            if XianyuLive.is_manual_refresh_active(account_id):
+                return {'success': False, 'message': f'账号 {account_id} 正在执行手动刷新，请稍候再试'}
 
         if not account_id or not account or not password:
             return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
@@ -2928,8 +3049,30 @@ async def password_login(
         log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
         
         # 生成会话ID
-        import secrets
         session_id = secrets.token_urlsafe(16)
+        risk_session_id = _new_risk_log_session_id('pwd')
+
+        # 记录手动刷新Cookie到风控日志
+        risk_log_id = None
+        if refresh_mode:
+            try:
+                risk_log_id = db_manager.add_risk_control_log(
+                    cookie_id=account_id,
+                    event_type='cookie_refresh',
+                    session_id=risk_session_id,
+                    trigger_scene='manual_password_refresh',
+                    result_code='manual_cookie_refresh_started',
+                    event_description='手动触发账密Cookie刷新',
+                    processing_status='processing',
+                    event_meta=_build_risk_event_meta({
+                        'account_id': account_id,
+                        'show_browser': bool(show_browser),
+                        'refresh_mode': True,
+                    })
+                )
+            except Exception as log_e:
+                risk_log_id = None
+                logger.error(f"记录风控日志失败: {log_e}")
         
         user_id = current_user['user_id']
         
@@ -2940,6 +3083,7 @@ async def password_login(
             'show_browser': show_browser,
             'refresh_mode': refresh_mode,  # 保存刷新模式标志
             'risk_control_log_id': risk_log_id if refresh_mode else None,  # 风控日志ID
+            'risk_session_id': risk_session_id,
             'status': 'processing',
             'verification_url': None,
             'screenshot_path': None,
@@ -2947,6 +3091,7 @@ async def password_login(
             'slider_instance': None,
             'task': None,
             'timestamp': time.time(),
+            'completed_at': None,
             'user_id': user_id
         }
         
@@ -2981,7 +3126,9 @@ async def check_password_login_status(
         current_time = time.time()
         expired_sessions = [
             sid for sid, session in password_login_sessions.items()
-            if current_time - session['timestamp'] > 3600
+            if (
+                session.get('completed_at') and current_time - session['completed_at'] > 300
+            ) or current_time - session['timestamp'] > 3600
         ]
         for sid in expired_sessions:
             if sid in password_login_sessions:
@@ -3022,17 +3169,16 @@ async def check_password_login_status(
                         log_with_user('warning', f"删除截图失败: {screenshot_path}", current_user)
                 except Exception as e:
                     log_with_user('error', f"删除截图时出错: {str(e)}", current_user)
+                finally:
+                    session['screenshot_path'] = None
             
-            result = {
+            return {
                 'status': 'success',
                 'message': f'账号 {session["account_id"]} 登录成功',
                 'account_id': session['account_id'],
                 'is_new_account': session.get('is_new_account', False),
                 'cookie_count': session.get('cookie_count', 0)
             }
-            # 清理会话
-            del password_login_sessions[session_id]
-            return result
         elif status == 'failed':
             # 登录失败
             # 删除截图（如果存在）
@@ -3046,17 +3192,16 @@ async def check_password_login_status(
                         log_with_user('warning', f"删除截图失败: {screenshot_path}", current_user)
                 except Exception as e:
                     log_with_user('error', f"删除截图时出错: {str(e)}", current_user)
+                finally:
+                    session['screenshot_path'] = None
             
             error_msg = session.get('error', '登录失败')
             log_with_user('info', f"返回登录失败状态: {session_id}, 错误消息: {error_msg}", current_user)  # 添加日志
-            result = {
+            return {
                 'status': 'failed',
                 'message': error_msg,
                 'error': error_msg  # 也包含error字段，确保前端能获取到
             }
-            # 清理会话
-            del password_login_sessions[session_id]
-            return result
         else:
             # 处理中
             return {
@@ -3229,7 +3374,18 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             record = qr_check_processed[session_id]
             if record['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
-                # 返回简单的成功状态，避免重复处理
+                if record.get('error'):
+                    return {'status': 'error', 'message': record['error']}
+
+                account_info = record.get('account_info')
+                if account_info:
+                    return {
+                        'status': 'success',
+                        'message': '扫码登录已完成',
+                        'account_info': account_info,
+                        'already_processed': True,
+                    }
+
                 return {'status': 'already_processed', 'message': '该会话已处理完成'}
 
         # 获取该session的锁
@@ -3244,6 +3400,19 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             # 再次检查是否已处理（双重检查）
             if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
+                record = qr_check_processed[session_id]
+                if record.get('error'):
+                    return {'status': 'error', 'message': record['error']}
+
+                account_info = record.get('account_info')
+                if account_info:
+                    return {
+                        'status': 'success',
+                        'message': '扫码登录已完成',
+                        'account_info': account_info,
+                        'already_processed': True,
+                    }
+
                 return {'status': 'already_processed', 'message': '该会话已处理完成'}
 
             # 清理过期会话
@@ -3254,24 +3423,63 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             log_with_user('info', f"获取会话状态1111111: {status_info}", current_user)
             if status_info['status'] == 'success':
                 log_with_user('info', f"获取会话状态22222222: {status_info}", current_user)
-                # 登录成功，处理Cookie（现在包含获取真实cookie的逻辑）
+
+                # 检查是否已经在后台处理中
+                if session_id in qr_check_processed and qr_check_processed[session_id].get('processing'):
+                    return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
+
+                # 标记为处理中，立即返回"已确认"状态（不阻塞前端）
+                qr_check_processed[session_id] = {
+                    'processed': False,
+                    'processing': True,
+                    'timestamp': time.time()
+                }
+
+                # 获取 Cookie 信息
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
                 log_with_user('info', f"获取会话Cookie: {cookies_info}", current_user)
+
                 if cookies_info:
-                    account_info = await process_qr_login_cookies(
-                        cookies_info['cookies'],
-                        cookies_info['unb'],
-                        current_user
-                    )
-                    status_info['account_info'] = account_info
+                    # 异步处理 Cookie（不阻塞当前请求）
+                    async def _process_cookies_background():
+                        try:
+                            account_info = await process_qr_login_cookies(
+                                cookies_info['cookies'],
+                                cookies_info['unb'],
+                                current_user
+                            )
+                            log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
+                            qr_check_processed[session_id] = {
+                                'processed': True,
+                                'processing': False,
+                                'timestamp': time.time(),
+                                'account_info': account_info
+                            }
+                        except Exception as bg_e:
+                            log_with_user('error', f"后台处理扫码Cookie失败: {bg_e}", current_user)
+                            qr_check_processed[session_id] = {
+                                'processed': True,
+                                'processing': False,
+                                'timestamp': time.time(),
+                                'error': str(bg_e)
+                            }
 
-                    log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
+                    asyncio.create_task(_process_cookies_background())
 
-                    # 标记该session已处理
-                    qr_check_processed[session_id] = {
-                        'processed': True,
-                        'timestamp': time.time()
-                    }
+                # 立即返回"已确认"状态
+                return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
+
+            # 检查后台处理是否已完成
+            if session_id in qr_check_processed:
+                record = qr_check_processed[session_id]
+                if record.get('processed') and not record.get('processing'):
+                    if record.get('error'):
+                        return {'status': 'error', 'message': record['error']}
+                    status_info['status'] = 'success'
+                    status_info['account_info'] = record.get('account_info', {})
+                    return status_info
+                elif record.get('processing'):
+                    return {'status': 'confirmed', 'message': '已确认，正在获取Cookie...'}
 
             return status_info
 
@@ -3325,12 +3533,21 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
         # 记录扫码登录到风控日志
         risk_log_id = None
+        risk_session_id = _new_risk_log_session_id('qr')
+        risk_log_started_at = time.time()
         try:
             risk_log_id = db_manager.add_risk_control_log(
                 cookie_id=account_id,
                 event_type='cookie_refresh',
-                event_description=f"扫码登录获取真实Cookie（{'新账号' if is_new_account else '已有账号'}）",
-                processing_status='processing'
+                session_id=risk_session_id,
+                trigger_scene='qr_login',
+                result_code='qr_cookie_refresh_started',
+                event_description='扫码登录获取真实Cookie',
+                processing_status='processing',
+                event_meta=_build_risk_event_meta({
+                    'account_id': account_id,
+                    'is_new_account': is_new_account,
+                })
             )
         except Exception as log_e:
             logger.error(f"记录风控日志失败: {log_e}")
@@ -3362,6 +3579,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
+                    XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready')
+
                     token_prewarmed = False
                     task_restarted = False
                     warning_message = None
@@ -3375,39 +3594,45 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         if prewarmed_token:
                             XianyuLive.cache_qr_prewarmed_token(account_id, prewarmed_token)
                             token_prewarmed = True
+                            XianyuLive.clear_qr_login_grace(account_id)
                             log_with_user('info', f"扫码登录Token预热成功: {account_id}", current_user)
                         else:
-                            warning_message = "真实Cookie已获取，但首次Token初始化失败，未切换到新的账号任务"
+                            warning_message = "真实Cookie已获取，但首次Token初始化未完成，将在账号任务启动后继续重试"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                     except Exception as token_e:
                         final_cookies = temp_instance.cookies_str or real_cookies
-                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，未切换到新的账号任务: {str(token_e)}"
+                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，将在账号任务启动后继续重试: {str(token_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
-                    if token_prewarmed:
-                        try:
-                            if cookie_manager.manager:
-                                if is_new_account:
-                                    cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
-                                    log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
-                                else:
-                                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                                    cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
-                                    log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
-                                task_restarted = True
+                    try:
+                        if cookie_manager.manager:
+                            if is_new_account:
+                                cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
+                                log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
                             else:
-                                warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                                # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
+                                cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
+                                log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                            task_restarted = True
+                            if not token_prewarmed:
+                                warning_message = warning_message or "真实Cookie已获取，账号任务已切换；首次Token将在后台继续初始化"
                                 log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                        except Exception as task_switch_e:
-                            XianyuLive.clear_qr_prewarmed_token(account_id)
-                            warning_message = f"真实Cookie和Token已获取，但切换账号任务失败: {str(task_switch_e)}"
+                        else:
+                            warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                    except Exception as task_switch_e:
+                        if token_prewarmed:
+                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                        XianyuLive.clear_qr_login_grace(account_id)
+                        warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
+                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
                     if not task_restarted:
                         if token_prewarmed:
                             XianyuLive.clear_qr_prewarmed_token(account_id)
+                        XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
-                            warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                            warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         if is_new_account:
                             db_manager.delete_cookie(account_id)
@@ -3421,18 +3646,43 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     # 更新风控日志状态
                     if risk_log_id:
                         try:
-                            if token_prewarmed and task_restarted:
+                            if task_restarted:
+                                processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
+                                if token_prewarmed:
+                                    processing_result += '，Token预热完成'
+                                else:
+                                    processing_result += '；Token预热未完成，将在首次刷新时继续重试'
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='success',
-                                    processing_result='扫码登录真实Cookie获取成功，Token预热完成并已启动账号任务'
+                                    processing_result=processing_result,
+                                    session_id=risk_session_id,
+                                    trigger_scene='qr_login',
+                                    result_code='qr_cookie_refresh_success',
+                                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                                    event_meta=_build_risk_event_meta({
+                                        'account_id': account_id,
+                                        'is_new_account': is_new_account,
+                                        'task_restarted': task_restarted,
+                                        'token_prewarmed': token_prewarmed,
+                                    })
                                 )
                             else:
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='failed',
-                                    error_message=(warning_message or 'Token预热失败，未启动账号任务')[:200],
-                                    processing_result='扫码登录真实Cookie获取成功，但未切换到新任务'
+                                    error_message=(warning_message or '账号任务未启动')[:200],
+                                    processing_result='扫码登录真实Cookie获取成功，但未切换到新任务',
+                                    session_id=risk_session_id,
+                                    trigger_scene='qr_login',
+                                    result_code='qr_cookie_task_not_started',
+                                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                                    event_meta=_build_risk_event_meta({
+                                        'account_id': account_id,
+                                        'is_new_account': is_new_account,
+                                        'task_restarted': task_restarted,
+                                        'token_prewarmed': token_prewarmed,
+                                    })
                                 )
                         except Exception:
                             pass
@@ -3440,7 +3690,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     return {
                         'account_id': account_id,
                         'is_new_account': is_new_account,
-                        'real_cookie_refreshed': True,
+                        'real_cookie_refreshed': task_restarted,  # 回滚时为 False，成功切换时为 True
                         'cookie_length': len(final_cookies),
                         'token_prewarmed': token_prewarmed,
                         'task_restarted': task_restarted,
@@ -3450,7 +3700,16 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     log_with_user('error', f"无法从数据库获取真实cookie: {account_id}", current_user)
                     if risk_log_id:
                         try:
-                            db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message='无法从数据库获取真实cookie')
+                            db_manager.update_risk_control_log(
+                                log_id=risk_log_id,
+                                processing_status='failed',
+                                error_message='无法从数据库获取真实cookie',
+                                session_id=risk_session_id,
+                                trigger_scene='qr_login',
+                                result_code='qr_cookie_missing_after_refresh',
+                                duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                                event_meta=_build_risk_event_meta({'account_id': account_id, 'is_new_account': is_new_account})
+                            )
                         except Exception:
                             pass
                     # 降级处理：使用原始扫码cookie
@@ -3459,7 +3718,16 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                 log_with_user('warning', f"扫码登录真实cookie获取失败: {account_id}", current_user)
                 if risk_log_id:
                     try:
-                        db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message='真实cookie获取失败')
+                        db_manager.update_risk_control_log(
+                            log_id=risk_log_id,
+                            processing_status='failed',
+                            error_message='真实cookie获取失败',
+                            session_id=risk_session_id,
+                            trigger_scene='qr_login',
+                            result_code='qr_cookie_refresh_failed',
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=_build_risk_event_meta({'account_id': account_id, 'is_new_account': is_new_account})
+                        )
                     except Exception:
                         pass
                 # 降级处理：使用原始扫码cookie
@@ -3469,7 +3737,16 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
             if risk_log_id:
                 try:
-                    db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message=str(refresh_e)[:200])
+                    db_manager.update_risk_control_log(
+                        log_id=risk_log_id,
+                        processing_status='failed',
+                        error_message=str(refresh_e)[:200],
+                        session_id=risk_session_id,
+                        trigger_scene='qr_login',
+                        result_code='qr_cookie_refresh_exception',
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=_build_risk_event_meta({'account_id': account_id, 'is_new_account': is_new_account})
+                    )
                 except Exception:
                     pass
             # 降级处理：使用原始扫码cookie
@@ -3537,12 +3814,18 @@ async def refresh_cookies_from_qr_login(
 
         # 记录扫码刷新Cookie到风控日志
         risk_log_id = None
+        risk_session_id = _new_risk_log_session_id('qrrefresh')
+        risk_log_started_at = time.time()
         try:
             risk_log_id = db_manager.add_risk_control_log(
                 cookie_id=cookie_id,
                 event_type='cookie_refresh',
-                event_description=f"手动触发Cookie刷新（扫码登录方式）",
-                processing_status='processing'
+                session_id=risk_session_id,
+                trigger_scene='manual_qr_refresh',
+                result_code='manual_qr_refresh_started',
+                event_description='手动触发扫码Cookie刷新',
+                processing_status='processing',
+                event_meta=_build_risk_event_meta({'account_id': cookie_id})
             )
         except Exception as log_e:
             logger.error(f"记录风控日志失败: {log_e}")
@@ -3570,7 +3853,16 @@ async def refresh_cookies_from_qr_login(
             # 更新风控日志状态
             if risk_log_id:
                 try:
-                    db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='success', processing_result='扫码Cookie刷新成功')
+                    db_manager.update_risk_control_log(
+                        log_id=risk_log_id,
+                        processing_status='success',
+                        processing_result='扫码Cookie刷新成功',
+                        session_id=risk_session_id,
+                        trigger_scene='manual_qr_refresh',
+                        result_code='manual_qr_refresh_success',
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=_build_risk_event_meta({'account_id': cookie_id})
+                    )
                 except Exception:
                     pass
 
@@ -3593,7 +3885,16 @@ async def refresh_cookies_from_qr_login(
             # 更新风控日志状态
             if risk_log_id:
                 try:
-                    db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message='获取真实cookie失败')
+                    db_manager.update_risk_control_log(
+                        log_id=risk_log_id,
+                        processing_status='failed',
+                        error_message='获取真实cookie失败',
+                        session_id=risk_session_id,
+                        trigger_scene='manual_qr_refresh',
+                        result_code='manual_qr_refresh_failed',
+                        duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                        event_meta=_build_risk_event_meta({'account_id': cookie_id})
+                    )
                 except Exception:
                     pass
             return {'success': False, 'message': '获取真实cookie失败'}
@@ -3603,7 +3904,16 @@ async def refresh_cookies_from_qr_login(
         # 更新风控日志状态
         if risk_log_id:
             try:
-                db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='failed', error_message=str(e)[:200])
+                db_manager.update_risk_control_log(
+                    log_id=risk_log_id,
+                    processing_status='failed',
+                    error_message=str(e)[:200],
+                    session_id=risk_session_id,
+                    trigger_scene='manual_qr_refresh',
+                    result_code='manual_qr_refresh_exception',
+                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                    event_meta=_build_risk_event_meta({'account_id': cookie_id})
+                )
             except Exception:
                 pass
         return {'success': False, 'message': f'刷新cookie失败: {str(e)}'}
@@ -6753,24 +7063,46 @@ async def get_logs(lines: int = 200, level: str = None, source: str = None, curr
 async def get_risk_control_logs(
     cookie_id: str = None,
     processing_status: str = None,
+    event_type: str = None,
+    trigger_scene: str = None,
+    session_id: str = None,
+    result_code: str = None,
+    date_from: str = None,
+    date_to: str = None,
     limit: int = 100,
     offset: int = 0,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
     """获取风控日志（管理员专用）"""
     try:
-        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, limit={limit}, offset={offset}", admin_user)
+        log_with_user(
+            'info',
+            f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, event_type={event_type}, trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, date_from={date_from}, date_to={date_to}, limit={limit}, offset={offset}",
+            admin_user,
+        )
 
         # 获取风控日志
         logs = db_manager.get_risk_control_logs(
             cookie_id=cookie_id,
             processing_status=processing_status,
+            event_type=event_type,
+            trigger_scene=trigger_scene,
+            session_id=session_id,
+            result_code=result_code,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
             offset=offset
         )
         total_count = db_manager.get_risk_control_logs_count(
             cookie_id=cookie_id,
-            processing_status=processing_status
+            processing_status=processing_status,
+            event_type=event_type,
+            trigger_scene=trigger_scene,
+            session_id=session_id,
+            result_code=result_code,
+            date_from=date_from,
+            date_to=date_to,
         )
 
         log_with_user('info', f"风控日志查询成功，共 {len(logs)} 条记录，总计 {total_count} 条", admin_user)
@@ -6790,6 +7122,57 @@ async def get_risk_control_logs(
             "message": f"获取风控日志失败: {str(e)}",
             "data": [],
             "total": 0
+        }
+
+
+@app.get("/admin/slider-verification-stats")
+async def get_slider_verification_stats(
+    cookie_id: str = None,
+    admin_user: Dict[str, Any] = Depends(require_admin)
+):
+    """获取当前系统用户下的滑块验证会话统计。"""
+    try:
+        user_id = admin_user['user_id']
+        user_cookie_ids = sorted(db_manager.get_all_cookies(user_id).keys())
+
+        if cookie_id:
+            if cookie_id not in user_cookie_ids:
+                return {
+                    'success': True,
+                    'data': {
+                        **_empty_slider_session_stats(),
+                        'scope_label': cookie_id,
+                        'selected_cookie_id': cookie_id,
+                    }
+                }
+            target_cookie_ids = [cookie_id]
+            scope_label = cookie_id
+        else:
+            target_cookie_ids = user_cookie_ids
+            scope_label = '全部账号'
+
+        stats = db_manager.get_slider_verification_session_stats(target_cookie_ids)
+        stats.update({
+            'scope_label': scope_label,
+            'selected_cookie_id': cookie_id or '',
+        })
+
+        log_with_user(
+            'info',
+            f"获取滑块验证会话统计成功: scope={scope_label}, sessions={stats['total_sessions']}, success_rate={stats['success_rate']}%",
+            admin_user,
+        )
+
+        return {
+            'success': True,
+            'data': stats,
+        }
+    except Exception as e:
+        log_with_user('error', f"获取滑块验证会话统计失败: {str(e)}", admin_user)
+        return {
+            'success': False,
+            'message': f'获取滑块验证会话统计失败: {str(e)}',
+            'data': _empty_slider_session_stats(),
         }
 
 
@@ -6865,9 +7248,9 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
         from XianyuAutoAsync import XianyuLive
         xianyu_instance = XianyuLive(cookies_str, cookie_id)
 
-        # 调用获取所有商品信息的方法（自动分页）
-        logger.info(f"开始获取账号 {cookie_id} 的所有商品信息")
-        result = await xianyu_instance.get_all_items()
+        # 调用获取所有商品信息的方法（自动分页）并同步最新商品详情
+        logger.info(f"开始同步账号 {cookie_id} 的所有商品信息和最新详情")
+        result = await xianyu_instance.get_all_items(sync_item_details=True)
 
         # 关闭session
         await xianyu_instance.close_session()
@@ -6878,10 +7261,10 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
         else:
             total_count = result.get('total_count', 0)
             total_pages = result.get('total_pages', 1)
-            logger.info(f"成功获取账号 {cookie_id} 的 {total_count} 个商品（共{total_pages}页）")
+            logger.info(f"成功同步账号 {cookie_id} 的 {total_count} 个商品（共{total_pages}页）")
             return {
                 "success": True,
-                "message": f"成功获取 {total_count} 个商品（共{total_pages}页），详细信息已打印到控制台",
+                "message": f"成功同步 {total_count} 个商品（共{total_pages}页），最新商品详情已更新",
                 "total_count": total_count,
                 "total_pages": total_pages
             }
@@ -6929,9 +7312,9 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
         from XianyuAutoAsync import XianyuLive
         xianyu_instance = XianyuLive(cookies_str, cookie_id)
 
-        # 调用获取指定页商品信息的方法
-        logger.info(f"开始获取账号 {cookie_id} 第{page_number}页商品信息（每页{page_size}条）")
-        result = await xianyu_instance.get_item_list_info(page_number, page_size)
+        # 调用获取指定页商品信息的方法并同步最新商品详情
+        logger.info(f"开始同步账号 {cookie_id} 第{page_number}页商品信息和最新详情（每页{page_size}条）")
+        result = await xianyu_instance.get_item_list_info(page_number, page_size, sync_item_details=True)
 
         # 关闭session
         await xianyu_instance.close_session()
@@ -6941,10 +7324,10 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
             return {"success": False, "message": result['error']}
         else:
             current_count = result.get('current_count', 0)
-            logger.info(f"成功获取账号 {cookie_id} 第{page_number}页 {current_count} 个商品")
+            logger.info(f"成功同步账号 {cookie_id} 第{page_number}页 {current_count} 个商品")
             return {
                 "success": True,
-                "message": f"成功获取第{page_number}页 {current_count} 个商品，详细信息已打印到控制台",
+                "message": f"成功同步第{page_number}页 {current_count} 个商品，最新商品详情已更新",
                 "page_number": page_number,
                 "page_size": page_size,
                 "current_count": current_count
@@ -7110,24 +7493,46 @@ def update_user_admin_status(user_id: int, is_admin: bool, admin_user: Dict[str,
 async def get_admin_risk_control_logs(
     cookie_id: str = None,
     processing_status: str = None,
+    event_type: str = None,
+    trigger_scene: str = None,
+    session_id: str = None,
+    result_code: str = None,
+    date_from: str = None,
+    date_to: str = None,
     limit: int = 100,
     offset: int = 0,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
     """获取风控日志（管理员专用）"""
     try:
-        log_with_user('info', f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, limit={limit}, offset={offset}", admin_user)
+        log_with_user(
+            'info',
+            f"查询风控日志: cookie_id={cookie_id}, processing_status={processing_status}, event_type={event_type}, trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, date_from={date_from}, date_to={date_to}, limit={limit}, offset={offset}",
+            admin_user,
+        )
 
         # 获取风控日志
         logs = db_manager.get_risk_control_logs(
             cookie_id=cookie_id,
             processing_status=processing_status,
+            event_type=event_type,
+            trigger_scene=trigger_scene,
+            session_id=session_id,
+            result_code=result_code,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
             offset=offset
         )
         total_count = db_manager.get_risk_control_logs_count(
             cookie_id=cookie_id,
-            processing_status=processing_status
+            processing_status=processing_status,
+            event_type=event_type,
+            trigger_scene=trigger_scene,
+            session_id=session_id,
+            result_code=result_code,
+            date_from=date_from,
+            date_to=date_to,
         )
 
         log_with_user('info', f"风控日志查询成功，共 {len(logs)} 条记录，总计 {total_count} 条", admin_user)

@@ -494,5 +494,10 @@ docker-deploy.bat
 本项目按“现状”提供，不提供任何明示或暗示的保证；因使用本项目产生的风险、损失或责任，由使用者自行承担。
 
 ## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date)](https://www.star-history.com/#GuDong2003/xianyu-auto-reply-fix&Date)
+<a href="https://www.star-history.com/#shaxiu/XianyuAutoAgent&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date" />
+ </picture>
+</a>
