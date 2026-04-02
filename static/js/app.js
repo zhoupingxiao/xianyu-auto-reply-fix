@@ -10546,6 +10546,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
 
         if (checkCount > maxChecks) {
             stopRefreshCookiePolling(sessionId);
+            closePasswordLoginQRModal();
             toggleLoading(false);
             showToast('刷新Cookie超时，请重试', 'warning');
             refreshCookiePollingState.inFlight = false;
@@ -10579,6 +10580,12 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     break;
                 case 'success':
                     stopRefreshCookiePolling(sessionId);
+                    const passwordLoginQRModal = document.getElementById('passwordLoginQRModal');
+                    if (passwordLoginQRModal && passwordLoginQRModal.classList.contains('show')) {
+                        setPasswordLoginQRModalStatus('验证已完成，正在刷新账号状态...');
+                        await new Promise(resolve => setTimeout(resolve, 400));
+                    }
+                    closePasswordLoginQRModal();
                     toggleLoading(false);
                     showToast(`账号 ${cookieId} Cookie刷新成功！`, 'success');
                     // 隐藏表单
@@ -10591,6 +10598,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                 case 'not_found':
                 case 'forbidden':
                     stopRefreshCookiePolling(sessionId);
+                    closePasswordLoginQRModal();
                     toggleLoading(false);
                     showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
                     break;
@@ -10736,6 +10744,7 @@ async function checkPasswordLoginStatus() {
                     // 错误情况
                     passwordLoginPollingState.completed = true;
                     clearPasswordLoginCheck();
+                    closePasswordLoginQRModal();
                     showToast(data.message || '登录检查失败', 'danger');
                     resetPasswordLoginForm();
                     break;
@@ -10746,11 +10755,13 @@ async function checkPasswordLoginStatus() {
                 const errorData = await response.json();
                 passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
+                closePasswordLoginQRModal();
                 showToast(errorData.message || '登录检查失败', 'danger');
                 resetPasswordLoginForm();
             } catch (e) {
                 passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
+                closePasswordLoginQRModal();
                 showToast('登录检查失败，请重试', 'danger');
                 resetPasswordLoginForm();
             }
@@ -10759,6 +10770,7 @@ async function checkPasswordLoginStatus() {
         console.error('检查账号密码登录状态失败:', error);
         passwordLoginPollingState.completed = true;
         clearPasswordLoginCheck();
+        closePasswordLoginQRModal();
         showToast('网络错误，请重试', 'danger');
         resetPasswordLoginForm();
     } finally {
@@ -10848,6 +10860,47 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
     }
 }
 
+function closePasswordLoginQRModal() {
+    const modalElement = document.getElementById('passwordLoginQRModal');
+    if (!modalElement) {
+        return;
+    }
+
+    const modalTitle = document.getElementById('passwordLoginQRModalLabel');
+    if (modalTitle) {
+        modalTitle.innerHTML = '<i class="bi bi-shield-exclamation text-warning me-2"></i>闲鱼验证';
+    }
+
+    const screenshotImg = document.getElementById('passwordLoginScreenshotImg');
+    if (screenshotImg) {
+        screenshotImg.src = '';
+        screenshotImg.style.display = 'none';
+    }
+
+    const linkButton = document.getElementById('passwordLoginVerificationLink');
+    if (linkButton) {
+        linkButton.href = '#';
+        linkButton.style.display = 'none';
+    }
+
+    const statusText = document.getElementById('passwordLoginQRStatusText');
+    if (statusText) {
+        statusText.textContent = '需要闲鱼人脸验证，请等待验证信息...';
+    }
+
+    const modalInstance = bootstrap.Modal.getInstance(modalElement);
+    if (modalInstance) {
+        modalInstance.hide();
+    }
+}
+
+function setPasswordLoginQRModalStatus(message) {
+    const statusText = document.getElementById('passwordLoginQRStatusText');
+    if (statusText) {
+        statusText.textContent = message;
+    }
+}
+
 // 创建账号密码登录二维码模态框
 function createPasswordLoginQRModal() {
     const modalHtml = `
@@ -10896,10 +10949,7 @@ function createPasswordLoginQRModal() {
 // 处理账号密码登录成功
 function handlePasswordLoginSuccess(data) {
     // 关闭二维码模态框
-    const modal = bootstrap.Modal.getInstance(document.getElementById('passwordLoginQRModal'));
-    if (modal) {
-        modal.hide();
-    }
+    closePasswordLoginQRModal();
     
     showToast(`账号 ${data.account_id} 登录成功！`, 'success');
     
@@ -10918,10 +10968,7 @@ function handlePasswordLoginFailure(data) {
     console.log('账号密码登录失败，错误数据:', data); // 调试日志
     
     // 关闭二维码模态框
-    const modal = bootstrap.Modal.getInstance(document.getElementById('passwordLoginQRModal'));
-    if (modal) {
-        modal.hide();
-    }
+    closePasswordLoginQRModal();
     
     // 优先使用 message，如果没有则使用 error 字段
     const errorMessage = data.message || data.error || '登录失败，请检查账号密码是否正确';
