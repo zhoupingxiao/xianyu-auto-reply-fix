@@ -34,6 +34,13 @@ from utils.time_utils import (
     utc_timestamp_to_local_date_string,
     utc_timestamp_to_local_datetime,
 )
+from utils.notification_dispatcher import (
+    build_face_verify_notification,
+    SUPPORTED_NOTIFICATION_TEMPLATE_TYPES,
+    dispatch_account_notifications_sync,
+    render_notification_template,
+    resolve_verification_type_label,
+)
 from order_event_hub import order_event_hub, publish_order_update_event
 
 from loguru import logger
@@ -2545,7 +2552,9 @@ def _empty_slider_session_stats() -> Dict[str, Any]:
         'recent_success': None,
         'recent_failure': None,
         'accounts_with_sessions': 0,
+        'accounts_with_failures': 0,
         'stats_mode': 'session',
+        'summary_text': '暂无滑块验证记录',
     }
 
 async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, show_browser: bool, user_id: int, current_user: Dict[str, Any]):
@@ -2589,7 +2598,13 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         password_login_sessions[session_id]['slider_instance'] = slider_instance
         
         # 定义通知回调函数，用于检测到人脸认证时返回验证链接或截图（同步函数）
-        def notification_callback(message: str, screenshot_path: str = None, verification_url: str = None, screenshot_path_new: str = None):
+        def notification_callback(
+            message: str,
+            screenshot_path: str = None,
+            verification_url: str = None,
+            screenshot_path_new: str = None,
+            verification_type: str = None,
+        ):
             """人脸认证通知回调（同步）
             
             Args:
@@ -2597,10 +2612,16 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 screenshot_path: 旧版截图路径（兼容参数）
                 verification_url: 验证链接
                 screenshot_path_new: 新版截图路径（新参数，优先使用）
+                verification_type: 验证类型
             """
             try:
                 # 优先使用新的截图路径参数
                 actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
+                verification_type_label = resolve_verification_type_label(
+                    verification_type,
+                    message,
+                    verification_url,
+                )
                 
                 # 优先使用截图路径，如果没有截图则使用验证链接
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
@@ -2618,46 +2639,26 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     def send_face_verification_notification():
                         """在后台线程中发送人脸验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
                             log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=None,
-                                            attachment_path=actual_screenshot_path
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            notification_message = build_face_verify_notification(
+                                account_id=account_id,
+                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_type=verification_type_label,
+                                verification_url=verification_url or '',
+                                error_message=message,
+                                has_screenshot=True,
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                                attachment_path=actual_screenshot_path,
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"人脸验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
                             log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
@@ -2684,45 +2685,25 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     def send_face_verification_notification():
                         """在后台线程中发送人脸验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
                             log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=verification_url
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            notification_message = build_face_verify_notification(
+                                account_id=account_id,
+                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_type=verification_type_label,
+                                verification_url=verification_url or '无',
+                                error_message=message,
+                                has_screenshot=False,
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"人脸验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
                             log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
@@ -2741,7 +2722,9 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         import threading
 
         def run_login():
+            import asyncio  # 在函数开头导入，避免后续局部import导致UnboundLocalError
             from db_manager import db_manager  # 在函数开头导入，避免作用域问题
+            from XianyuAutoAsync import XianyuLive
             try:
                 cookies_dict = slider_instance.login_with_password_playwright(
                     account=account,
@@ -2759,14 +2742,86 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     _update_session_risk_log(session_id, 'failed', error_message=failure_message[:200])
                     return
                 
-                # 将cookie字典转换为字符串格式
-                cookies_str = '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
-                
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
                 
                 # 检查是否已存在相同账号ID的Cookie
                 existing_cookies = db_manager.get_all_cookies(user_id)
                 is_new_account = account_id not in existing_cookies
+                existing_cookie_value = existing_cookies.get(account_id, '') if not is_new_account else ''
+                existing_cookie_dict = trans_cookies(existing_cookie_value) if existing_cookie_value else {}
+
+                merge_result = XianyuLive.protected_merge_cookie_dicts(existing_cookie_dict, cookies_dict)
+                if merge_result['incoming_missing_protected_fields']:
+                    log_with_user(
+                        'warning',
+                        f"密码登录返回的Cookie快照缺少关键字段，将进行保护性合并: {', '.join(merge_result['incoming_missing_protected_fields'])}",
+                        current_user
+                    )
+                if merge_result['preserved_protected_fields']:
+                    log_with_user(
+                        'warning',
+                        f"密码登录保护性保留旧关键字段: {', '.join(merge_result['preserved_protected_fields'])}",
+                        current_user
+                    )
+                if merge_result['account_switched']:
+                    log_with_user('warning', f"检测到unb变化，按账号切换处理: {account_id}", current_user)
+
+                merged_cookies_dict = merge_result['merged_cookies_dict']
+                log_with_user(
+                    'info',
+                    f"manual_login_protected_merge incoming_count={merge_result.get('incoming_count', len(cookies_dict))} "
+                    f"existing_count={merge_result.get('existing_count', len(existing_cookie_dict))} "
+                    f"merged_count={merge_result.get('merged_count', len(merged_cookies_dict))} "
+                    f"protected_preserved_fields={merge_result.get('preserved_protected_fields') or []} "
+                    f"would_remove_fields={merge_result.get('would_remove_fields') or []} "
+                    f"account_switched={merge_result.get('account_switched', False)}",
+                    current_user
+                )
+                cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
+
+                if merge_result['missing_required_fields']:
+                    missing_fields_text = ', '.join(merge_result['missing_required_fields'])
+                    error_message = f"登录成功但Cookie核心字段仍缺失，未覆盖旧Cookie: {missing_fields_text}"
+                    log_with_user('error', f"{error_message}: {account_id}", current_user)
+                    _set_password_login_session_status(session_id, 'failed', error=error_message)
+                    _update_session_risk_log(
+                        session_id,
+                        'failed',
+                        error_message=error_message[:200],
+                        result_code='password_login_cookie_incomplete',
+                        event_meta={
+                            'missing_required_fields': merge_result['missing_required_fields'],
+                            'incoming_missing_protected_fields': merge_result['incoming_missing_protected_fields'],
+                            'preserved_protected_fields': merge_result['preserved_protected_fields'],
+                        }
+                    )
+                    return
+
+                if is_refresh_mode:
+                    try:
+                        log_with_user('info', f"刷新模式开始执行Token预检，确认新实例可直接恢复: {account_id}", current_user)
+                        XianyuLive.mark_manual_refresh_handoff(account_id, source=manual_refresh_owner)
+                        temp_xianyu = XianyuLive(
+                            cookies_str=cookies_str,
+                            cookie_id=account_id,
+                            user_id=user_id,
+                        )
+                        asyncio.run(temp_xianyu.preflight_token_after_manual_refresh())
+                        cookies_str = temp_xianyu.cookies_str
+                        merged_cookies_dict = trans_cookies(cookies_str)
+                        log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
+                    except Exception as preflight_err:
+                        error_message = f"刷新模式认证预检失败，任务未切换: {str(preflight_err)}"
+                        log_with_user('error', f"{error_message}: {account_id}", current_user)
+                        _set_password_login_session_status(session_id, 'failed', error=error_message)
+                        _update_session_risk_log(
+                            session_id,
+                            'failed',
+                            error_message=error_message[:200],
+                            result_code='manual_refresh_preflight_failed',
+                            event_meta={'account_id': account_id},
+                        )
+                        return
                 
                 # 保存账号密码和Cookie到数据库
                 # 使用 update_cookie_account_info 来保存，它会自动处理新账号和现有账号的情况
@@ -2833,12 +2888,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 logger.error(traceback.format_exc())
                 
                 if is_refresh_mode:
-                    log_with_user('info', f"刷新模式跳过额外浏览器Cookie刷新，直接使用当前登录结果: {account_id}", current_user)
+                    log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
                 else:
                     # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
                     try:
                         log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                        from XianyuAutoAsync import XianyuLive
                         
                         # 创建临时的XianyuLive实例来刷新Cookie
                         temp_xianyu = XianyuLive(
@@ -2905,52 +2959,39 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     'success',
                     account_id=account_id,
                     is_new_account=is_new_account,
-                    cookie_count=len(cookies_dict)
+                    cookie_count=len(merged_cookies_dict)
                 )
                 # 更新风控日志状态
-                _update_session_risk_log(session_id, 'success', processing_result='Cookie刷新成功')
+                _update_session_risk_log(
+                    session_id,
+                    'success',
+                    processing_result='Cookie刷新成功，认证预检通过' if is_refresh_mode else 'Cookie刷新成功'
+                )
 
                 # 发送登录成功通知（使用模板系统）
                 try:
-                    from utils.slider_patch import send_notification
-                    from db_manager import db_manager
-
                     # 根据模式选择不同模板
                     notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
                     template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
 
-                    # 获取模板
-                    template_data = db_manager.get_notification_template(template_type)
-                    if template_data and template_data.get('template'):
-                        template = template_data['template']
-                    else:
-                        if notify_refresh_mode:
-                            template = '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-                        else:
-                            template = '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...'''
-
-                    # 格式化模板
-                    notification_message = template.replace('{account_id}', account_id)
-                    notification_message = notification_message.replace('{time}', time.strftime('%Y-%m-%d %H:%M:%S'))
-                    notification_message = notification_message.replace('{cookie_count}', str(len(cookies_dict)))
+                    notification_message = render_notification_template(
+                        template_type,
+                        account_id=account_id,
+                        time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                        cookie_count=str(len(merged_cookies_dict))
+                    )
 
                     login_type = "刷新Cookie" if notify_refresh_mode else "密码登录"
-                    notification_title = f"🎉 {login_type}成功"
-
-                    send_notification(account_id, notification_title, notification_message, "success")
-                    log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    notification_sent = dispatch_account_notifications_sync(
+                        account_id,
+                        notification_message,
+                        title=f"{login_type}成功",
+                        notification_type=template_type,
+                    )
+                    if notification_sent:
+                        log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    else:
+                        log_with_user('warning', f"{login_type}成功通知未发送成功: {account_id}", current_user)
                 except Exception as notify_err:
                     log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
                 
@@ -4349,7 +4390,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
     from db_manager import db_manager
 
     try:
-        if data.template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if data.template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 获取所有已启用的通知渠道
@@ -4394,6 +4435,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             'face_verify': {
                 'account_id': '测试账号',
                 'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'verification_action': '请点击验证链接完成验证:',
                 'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test',
                 'verification_type': '人脸验证'
             },
@@ -4589,7 +4631,7 @@ def get_notification_template(template_type: str, current_user: Dict[str, Any] =
     """获取指定类型的通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         template = db_manager.get_notification_template(template_type)
@@ -4618,7 +4660,7 @@ def update_notification_template(template_type: str, data: NotificationTemplateI
     """更新通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 如果模板不存在，先插入默认值
@@ -4648,7 +4690,7 @@ def reset_notification_template(template_type: str, current_user: Dict[str, Any]
     """重置通知模板为默认值"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         success = db_manager.reset_notification_template(template_type)
@@ -4669,7 +4711,7 @@ def get_default_notification_template(template_type: str, current_user: Dict[str
     """获取默认通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         default_template = db_manager.get_default_notification_template(template_type)
@@ -7130,7 +7172,7 @@ async def get_slider_verification_stats(
     cookie_id: str = None,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
-    """获取当前系统用户下的滑块验证会话统计。"""
+    """获取当前系统用户下的滑块验证统计。"""
     try:
         user_id = admin_user['user_id']
         user_cookie_ids = sorted(db_manager.get_all_cookies(user_id).keys())
@@ -7159,7 +7201,7 @@ async def get_slider_verification_stats(
 
         log_with_user(
             'info',
-            f"获取滑块验证会话统计成功: scope={scope_label}, sessions={stats['total_sessions']}, success_rate={stats['success_rate']}%",
+            f"获取滑块验证统计成功: scope={scope_label}, sessions={stats['total_sessions']}, success={stats['success_count']}, failure={stats['failure_count']}",
             admin_user,
         )
 
@@ -7168,10 +7210,10 @@ async def get_slider_verification_stats(
             'data': stats,
         }
     except Exception as e:
-        log_with_user('error', f"获取滑块验证会话统计失败: {str(e)}", admin_user)
+        log_with_user('error', f"获取滑块验证统计失败: {str(e)}", admin_user)
         return {
             'success': False,
-            'message': f'获取滑块验证会话统计失败: {str(e)}',
+            'message': f'获取滑块验证统计失败: {str(e)}',
             'data': _empty_slider_session_stats(),
         }
 
@@ -8569,6 +8611,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
 
         unit_results = []
+        prepared_units = []
 
         def format_delivery_reason(reason: str, order_spec_mode: str = None, rule_spec_mode: str = None, item_config_mode: str = None) -> str:
             context_parts = []
@@ -8635,126 +8678,11 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             if delivery_success:
                 if not delivery_steps:
                     delivery_steps = xianyu_instance._build_delivery_steps(delivery_content, '')
-
-                try:
-                    ws = getattr(xianyu_instance, 'ws', None)
-                    if ws:
-                        sid = order.get('sid', '')
-                        if sid:
-                            cid = sid.replace('@goofish', '')
-                            log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={cid}, buyer_id={buyer_id}, unit={unit_index}", current_user)
-                            await xianyu_instance._send_delivery_steps(
-                                ws,
-                                cid,
-                                buyer_id,
-                                delivery_steps,
-                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
-                            )
-                        else:
-                            log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, unit={unit_index}", current_user)
-                            await xianyu_instance._send_delivery_steps(
-                                ws,
-                                buyer_id,
-                                buyer_id,
-                                delivery_steps,
-                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
-                            )
-                    else:
-                        log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, unit={unit_index}", current_user)
-                        await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
-
-                    if not xianyu_instance._mark_data_reservation_sent_if_needed({
-                        'data_reservation_id': data_reservation_id,
-                        'data_reservation_status': data_reservation_status
-                    }):
-                        xianyu_instance._release_data_reservation_if_needed(
-                            {'data_reservation_id': data_reservation_id},
-                            error=f'手动发货发送成功后标记预占已发送失败(unit={unit_index})'
-                        )
-                        unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': '批量数据预占标记已发送失败'})
-                        continue
-
-                    delivery_meta = {
-                        'success': True,
-                        'rule_id': rule_id,
-                        'card_id': card_id,
-                        'card_type': card_type,
-                        'data_card_pending_consume': data_card_pending_consume,
-                        'data_line': data_line,
-                        'data_reservation_id': data_reservation_id,
-                        'data_reservation_status': data_reservation_status,
-                        'delivery_unit_index': unit_index,
-                    }
-                    xianyu_instance._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=delivery_meta,
-                        channel='manual',
-                        status='sent'
-                    )
-
-                    finalize_result = await xianyu_instance._finalize_delivery_after_send(
-                        delivery_meta=delivery_meta,
-                        order_id=order_id,
-                        item_id=item_id
-                    )
-                    if not finalize_result.get('success'):
-                        xianyu_instance._persist_delivery_finalization_state(
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=buyer_id,
-                            delivery_meta=delivery_meta,
-                            channel='manual',
-                            status='sent',
-                            last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
-                        )
-                        db_manager.create_delivery_log(
-                            user_id=user_id,
-                            cookie_id=cookie_id,
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=buyer_id,
-                            buyer_nick=order.get('buyer_nick'),
-                            rule_id=rule_id,
-                            rule_keyword=rule_keyword,
-                            card_type=card_type,
-                            match_mode=match_mode,
-                            channel='manual',
-                            status='failed',
-                            reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', order_spec_mode, rule_spec_mode, item_config_mode)
-                        )
-                        unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
-                        continue
-
-                    xianyu_instance._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=delivery_meta,
-                        channel='manual',
-                        status='finalized'
-                    )
-                    db_manager.create_delivery_log(
-                        user_id=user_id,
-                        cookie_id=cookie_id,
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        buyer_nick=order.get('buyer_nick'),
-                        rule_id=rule_id,
-                        rule_keyword=rule_keyword,
-                        card_type=card_type,
-                        match_mode=match_mode,
-                        channel='manual',
-                        status='success',
-                        reason=format_delivery_reason(f'手动发货第 {unit_index} 个单元发送成功', order_spec_mode, rule_spec_mode, item_config_mode)
-                    )
-                    unit_results.append({'unit_index': unit_index, 'status': 'finalized'})
-                except Exception as send_error:
+                if not delivery_steps:
+                    fail_reason = f"第 {unit_index} 个发货单元发货步骤构建失败"
                     xianyu_instance._release_data_reservation_if_needed(
                         {'data_reservation_id': data_reservation_id},
-                        error=f"手动发货发送失败(unit={unit_index}): {str(send_error)}"
+                        error=fail_reason
                     )
                     db_manager.create_delivery_log(
                         user_id=user_id,
@@ -8769,9 +8697,32 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                         match_mode=match_mode,
                         channel='manual',
                         status='failed',
-                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息发送失败: {str(send_error)}", order_spec_mode, rule_spec_mode, item_config_mode)
+                        reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                     )
-                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': str(send_error)})
+                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+                    continue
+
+                prepared_units.append({
+                    'unit_index': unit_index,
+                    'delivery_steps': delivery_steps,
+                    'card_type': card_type,
+                    'rule_meta': {
+                        'success': True,
+                        'rule_id': rule_id,
+                        'rule_keyword': rule_keyword,
+                        'card_id': card_id,
+                        'card_type': card_type,
+                        'match_mode': match_mode,
+                        'order_spec_mode': order_spec_mode,
+                        'rule_spec_mode': rule_spec_mode,
+                        'item_config_mode': item_config_mode,
+                        'data_card_pending_consume': data_card_pending_consume,
+                        'data_line': data_line,
+                        'data_reservation_id': data_reservation_id,
+                        'data_reservation_status': data_reservation_status,
+                        'delivery_unit_index': unit_index,
+                    }
+                })
             else:
                 fail_reason = failure_reason or f"第 {unit_index} 个发货单元未匹配到发货规则，请检查卡券和发货规则配置"
                 db_manager.create_delivery_log(
@@ -8790,6 +8741,198 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                     reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                 )
                 unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+
+        ws = getattr(xianyu_instance, 'ws', None)
+        manual_chat_id = buyer_id
+        if ws:
+            sid = order.get('sid', '')
+            if sid:
+                manual_chat_id = sid.replace('@goofish', '')
+                log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={manual_chat_id}, buyer_id={buyer_id}", current_user)
+            else:
+                log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, buyer_id={buyer_id}", current_user)
+        else:
+            log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, buyer_id={buyer_id}", current_user)
+
+        send_groups = xianyu_instance._build_delivery_send_groups(prepared_units, expected_quantity)
+        total_send_groups = len(send_groups)
+
+        for group_index, send_group in enumerate(send_groups, start=1):
+            group_units = send_group.get('units') or []
+            if not group_units:
+                continue
+
+            first_unit = group_units[0]
+            first_unit_index = first_unit.get('unit_index') or 1
+            is_batched_text_group = send_group.get('mode') == 'batched_text'
+
+            try:
+                if ws:
+                    await xianyu_instance._send_delivery_steps(
+                        ws,
+                        manual_chat_id,
+                        buyer_id,
+                        send_group.get('delivery_steps') or [],
+                        log_prefix=(
+                            f"手动发货 order_id={order_id} batch={group_index}/{total_send_groups}"
+                            if is_batched_text_group else
+                            f"手动发货 order_id={order_id} unit={first_unit_index}"
+                        )
+                    )
+                else:
+                    await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, send_group.get('delivery_steps') or [])
+            except Exception as send_error:
+                send_error_text = str(send_error)
+                for prepared_unit in group_units:
+                    unit_index = prepared_unit.get('unit_index') or 1
+                    rule_meta = prepared_unit.get('rule_meta') or {}
+                    xianyu_instance._release_data_reservation_if_needed(
+                        rule_meta,
+                        error=f"手动发货发送失败(unit={unit_index}): {send_error_text}"
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='failed',
+                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息发送失败: {send_error_text}", rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': send_error_text})
+                continue
+
+            for prepared_unit in group_units:
+                unit_index = prepared_unit.get('unit_index') or 1
+                rule_meta = prepared_unit.get('rule_meta') or {}
+
+                try:
+                    if not xianyu_instance._mark_data_reservation_sent_if_needed(rule_meta):
+                        xianyu_instance._release_data_reservation_if_needed(
+                            rule_meta,
+                            error=f'手动发货发送成功后标记预占已发送失败(unit={unit_index})'
+                        )
+                        db_manager.create_delivery_log(
+                            user_id=user_id,
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            rule_id=rule_meta.get('rule_id'),
+                            rule_keyword=rule_meta.get('rule_keyword'),
+                            card_type=rule_meta.get('card_type'),
+                            match_mode=rule_meta.get('match_mode'),
+                            channel='manual',
+                            status='failed',
+                            reason=format_delivery_reason('批量数据预占标记已发送失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': '批量数据预占标记已发送失败'})
+                        continue
+
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='sent'
+                    )
+
+                    finalize_result = await xianyu_instance._finalize_delivery_after_send(
+                        delivery_meta=rule_meta,
+                        order_id=order_id,
+                        item_id=item_id
+                    )
+                    if not finalize_result.get('success'):
+                        xianyu_instance._persist_delivery_finalization_state(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            delivery_meta=rule_meta,
+                            channel='manual',
+                            status='sent',
+                            last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
+                        )
+                        db_manager.create_delivery_log(
+                            user_id=user_id,
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            rule_id=rule_meta.get('rule_id'),
+                            rule_keyword=rule_meta.get('rule_keyword'),
+                            card_type=rule_meta.get('card_type'),
+                            match_mode=rule_meta.get('match_mode'),
+                            channel='manual',
+                            status='failed',
+                            reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
+                        continue
+
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='finalized'
+                    )
+                    success_reason = f'手动发货第 {unit_index} 个单元发送成功'
+                    if is_batched_text_group and len(group_units) > 1:
+                        success_reason += '（批量合并发送）'
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='success',
+                        reason=format_delivery_reason(success_reason, rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'finalized'})
+
+                except Exception as unit_post_error:
+                    unit_error_text = str(unit_post_error)
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='sent',
+                        last_error=f'第 {unit_index} 个发货单元消息已发送，但发送后处理异常: {unit_error_text}'
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='failed',
+                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息已发送，但发送后处理异常: {unit_error_text}", rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': unit_error_text})
 
         progress_summary_after = xianyu_instance._sync_order_delivery_progress(
             order_id=order_id,

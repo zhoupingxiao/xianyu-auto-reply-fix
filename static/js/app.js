@@ -5625,6 +5625,7 @@ const templatePreviewData = {
     face_verify: {
         account_id: 'test_account',
         time: new Date().toLocaleString('zh-CN'),
+        verification_action: '请点击验证链接完成验证:',
         verification_url: 'https://passport.goofish.com/mini_login.htm?example=test',
         verification_type: '人脸验证'
     },
@@ -10546,6 +10547,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
 
         if (checkCount > maxChecks) {
             stopRefreshCookiePolling(sessionId);
+            closePasswordLoginQRModal();
             toggleLoading(false);
             showToast('刷新Cookie超时，请重试', 'warning');
             refreshCookiePollingState.inFlight = false;
@@ -10579,6 +10581,12 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     break;
                 case 'success':
                     stopRefreshCookiePolling(sessionId);
+                    const passwordLoginQRModal = document.getElementById('passwordLoginQRModal');
+                    if (passwordLoginQRModal && passwordLoginQRModal.classList.contains('show')) {
+                        setPasswordLoginQRModalStatus('验证已完成，正在刷新账号状态...');
+                        await new Promise(resolve => setTimeout(resolve, 400));
+                    }
+                    closePasswordLoginQRModal();
                     toggleLoading(false);
                     showToast(`账号 ${cookieId} Cookie刷新成功！`, 'success');
                     // 隐藏表单
@@ -10591,6 +10599,7 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                 case 'not_found':
                 case 'forbidden':
                     stopRefreshCookiePolling(sessionId);
+                    closePasswordLoginQRModal();
                     toggleLoading(false);
                     showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
                     break;
@@ -10736,6 +10745,7 @@ async function checkPasswordLoginStatus() {
                     // 错误情况
                     passwordLoginPollingState.completed = true;
                     clearPasswordLoginCheck();
+                    closePasswordLoginQRModal();
                     showToast(data.message || '登录检查失败', 'danger');
                     resetPasswordLoginForm();
                     break;
@@ -10746,11 +10756,13 @@ async function checkPasswordLoginStatus() {
                 const errorData = await response.json();
                 passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
+                closePasswordLoginQRModal();
                 showToast(errorData.message || '登录检查失败', 'danger');
                 resetPasswordLoginForm();
             } catch (e) {
                 passwordLoginPollingState.completed = true;
                 clearPasswordLoginCheck();
+                closePasswordLoginQRModal();
                 showToast('登录检查失败，请重试', 'danger');
                 resetPasswordLoginForm();
             }
@@ -10759,6 +10771,7 @@ async function checkPasswordLoginStatus() {
         console.error('检查账号密码登录状态失败:', error);
         passwordLoginPollingState.completed = true;
         clearPasswordLoginCheck();
+        closePasswordLoginQRModal();
         showToast('网络错误，请重试', 'danger');
         resetPasswordLoginForm();
     } finally {
@@ -10848,6 +10861,47 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
     }
 }
 
+function closePasswordLoginQRModal() {
+    const modalElement = document.getElementById('passwordLoginQRModal');
+    if (!modalElement) {
+        return;
+    }
+
+    const modalTitle = document.getElementById('passwordLoginQRModalLabel');
+    if (modalTitle) {
+        modalTitle.innerHTML = '<i class="bi bi-shield-exclamation text-warning me-2"></i>闲鱼验证';
+    }
+
+    const screenshotImg = document.getElementById('passwordLoginScreenshotImg');
+    if (screenshotImg) {
+        screenshotImg.src = '';
+        screenshotImg.style.display = 'none';
+    }
+
+    const linkButton = document.getElementById('passwordLoginVerificationLink');
+    if (linkButton) {
+        linkButton.href = '#';
+        linkButton.style.display = 'none';
+    }
+
+    const statusText = document.getElementById('passwordLoginQRStatusText');
+    if (statusText) {
+        statusText.textContent = '需要闲鱼人脸验证，请等待验证信息...';
+    }
+
+    const modalInstance = bootstrap.Modal.getInstance(modalElement);
+    if (modalInstance) {
+        modalInstance.hide();
+    }
+}
+
+function setPasswordLoginQRModalStatus(message) {
+    const statusText = document.getElementById('passwordLoginQRStatusText');
+    if (statusText) {
+        statusText.textContent = message;
+    }
+}
+
 // 创建账号密码登录二维码模态框
 function createPasswordLoginQRModal() {
     const modalHtml = `
@@ -10896,10 +10950,7 @@ function createPasswordLoginQRModal() {
 // 处理账号密码登录成功
 function handlePasswordLoginSuccess(data) {
     // 关闭二维码模态框
-    const modal = bootstrap.Modal.getInstance(document.getElementById('passwordLoginQRModal'));
-    if (modal) {
-        modal.hide();
-    }
+    closePasswordLoginQRModal();
     
     showToast(`账号 ${data.account_id} 登录成功！`, 'success');
     
@@ -10918,10 +10969,7 @@ function handlePasswordLoginFailure(data) {
     console.log('账号密码登录失败，错误数据:', data); // 调试日志
     
     // 关闭二维码模态框
-    const modal = bootstrap.Modal.getInstance(document.getElementById('passwordLoginQRModal'));
-    if (modal) {
-        modal.hide();
-    }
+    closePasswordLoginQRModal();
     
     // 优先使用 message，如果没有则使用 error 字段
     const errorMessage = data.message || data.error || '登录失败，请检查账号密码是否正确';
@@ -14699,10 +14747,10 @@ function renderRiskControlSliderStats(stats = {}) {
     const hasData = Boolean(stats.has_data || totalSessions > 0);
     const recentSuccessText = formatBeijingDateTime(stats.recent_success);
     const recentFailureText = formatBeijingDateTime(stats.recent_failure);
-    let attemptSummary = '暂无结构化滑块会话统计';
+    let attemptSummary = stats.summary_text || '暂无滑块验证记录';
 
     if (hasData) {
-        attemptSummary = `累计结构化会话 ${totalSessions} 次`;
+        attemptSummary = `累计滑块相关记录 ${totalSessions} 次`;
         if (processingCount > 0) {
             attemptSummary += `，进行中 ${processingCount} 次`;
         }
@@ -14756,6 +14804,7 @@ async function loadRiskControlSliderStats(cookieId = '') {
             success_rate: 0,
             recent_success: '--',
             recent_failure: '--',
+            summary_text: '暂无滑块验证记录',
             has_data: false
         });
     } catch (error) {
@@ -14773,6 +14822,7 @@ async function loadRiskControlSliderStats(cookieId = '') {
             success_rate: 0,
             recent_success: '--',
             recent_failure: '--',
+            summary_text: '暂无滑块验证记录',
             has_data: false
         });
     }
@@ -15809,7 +15859,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.8.0';
+const DEFAULT_VERSION = 'v1.8.2';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -15920,9 +15970,29 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.8.0',
+    version: 'v1.8.2',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.8.2',
+            date: '2026-04-04',
+            updates: [
+                '【修复】修复 Token 刷新循环因 last_token_refresh_status 属性未初始化导致崩溃的问题',
+                '【修复】修复手动刷新认证预检因 asyncio 局部变量遮蔽导致 UnboundLocalError 的问题'
+            ]
+        },
+        {
+            version: 'v1.8.1',
+            date: '2026-04-03',
+            updates: [
+                '【修复】滑块恢复与令牌刷新链路更稳定，滑块成功后会及时回写有效会话 Cookie，并保护关键会话字段不被不完整快照覆盖',
+                '【修复】手动刷新后的任务交接与初始化鉴权恢复，新增 Token 预检、交接恢复窗口、恢复锁和鉴权失败冷静期，减少 WebSocket 已连通但因 Token 获取失败反复重试',
+                '【修复】统一通知派发路径并收口验证通知，修正推送冷却、人脸验证通知类型/文案/模板渲染，以及定时刷新误报',
+                '【优化】账密登录与手动刷新流程里的滑块验证也会写入风控日志和滑块统计，风控排查口径更完整',
+                '【修复】取消订单后的系统卡片不再覆盖真实 buyer_id，避免订单买家信息被异常值污染',
+                '【优化】多数量纯文本卡券消息支持批量合并发送，减少重复刷屏，卡券发货提示更简洁'
+            ]
+        },
         {
             version: 'v1.8.0',
             date: '2026-04-01',
