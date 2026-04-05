@@ -181,7 +181,7 @@ ML_STRATEGY_CONFIG = {
             "base_delay": (0.010, 0.020),      # 🔧 增加延迟（10-20ms）
             "acceleration_curve": (1.8, 2.4),  # 更平滑的ease-out
             "y_jitter_max": (0.8, 2.0),        # 较小Y抖动
-            "weight": 0.18,
+            "weight": 0.08,                    # 🔧 从0.18降到0.08，历史成功率仅12%
         },
         # 标准策略：中等超调，模拟普通用户
         "standard": {
@@ -190,7 +190,7 @@ ML_STRATEGY_CONFIG = {
             "base_delay": (0.006, 0.015),      # 6-15ms延迟
             "acceleration_curve": (1.5, 2.1),
             "y_jitter_max": (1.2, 2.8),
-            "weight": 0.47,
+            "weight": 0.57,                    # 🔧 从0.47提高到0.57，吸收conservative释放的权重
         },
         # 激进策略：较大超调，模拟快速用户
         "aggressive": {
@@ -225,7 +225,7 @@ ML_STRATEGY_CONFIG = {
         "enabled": True,
         "min_samples": 3,                  # 🔧 从5降到3，更快开始调整
         "smoothing_factor": 0.4,           # 🔧 从0.3增加到0.4，更快响应
-        "min_weight": 0.15,                # 🔧 从0.10增加到0.15
+        "min_weight": 0.05,                # 🔧 从0.15降到0.05，允许低效策略被进一步压低
         "max_weight": 0.55,                # 🔧 从0.60降到0.55
     },
 
@@ -266,10 +266,10 @@ class AdaptiveStrategyManager:
                 "aggressive": {"success": 0, "fail": 0, "total": 0},
                 "learned_with_jitter": {"success": 0, "fail": 0, "total": 0},
             }
-            # 动态权重
+            # 动态权重（与 ML_STRATEGY_CONFIG 初始权重一致）
             self.dynamic_weights = {
-                "conservative": 0.18,
-                "standard": 0.47,
+                "conservative": 0.08,
+                "standard": 0.57,
                 "aggressive": 0.35,
             }
             # 统计文件路径
@@ -279,6 +279,9 @@ class AdaptiveStrategyManager:
             self._initialized = True
             logger.info("🤖 自适应策略管理器初始化完成")
     
+    # 已废弃的策略名称，加载时自动清理
+    _DEPRECATED_STRATEGIES = {"slow_fallback"}
+
     def _load_stats(self):
         """加载历史统计数据"""
         try:
@@ -287,6 +290,18 @@ class AdaptiveStrategyManager:
                     data = json.load(f)
                     self.strategy_stats.update(data.get("strategy_stats", {}))
                     self.dynamic_weights.update(data.get("dynamic_weights", {}))
+                # 清理已废弃策略的残留数据
+                cleaned = False
+                for dep in self._DEPRECATED_STRATEGIES:
+                    if dep in self.strategy_stats:
+                        del self.strategy_stats[dep]
+                        cleaned = True
+                    if dep in self.dynamic_weights:
+                        del self.dynamic_weights[dep]
+                        cleaned = True
+                if cleaned:
+                    logger.info(f"🤖 已清理废弃策略统计: {self._DEPRECATED_STRATEGIES}")
+                    self._save_stats()
                 logger.info(f"🤖 加载历史策略统计: {self.stats_file}")
         except Exception as e:
             logger.warning(f"🤖 加载策略统计失败: {e}")
@@ -3178,34 +3193,60 @@ class XianyuSliderStealth:
             profile_name = "primary"
 
             if attempt >= slow_fallback_threshold:
-                # 第 3 次及以后：仅在高收益分支中轮换，移除 slow_fallback
-                rotation_strategies = ["aggressive", "standard"]
-                rotation_idx = (attempt - slow_fallback_threshold) % len(rotation_strategies)
-                selected_strategy = rotation_strategies[rotation_idx]
-                profile_name = f"retry_rotation_{selected_strategy}"
+                # 第 3 次及以后：优先使用 learned 变体（加大抖动），无学习数据时才轮换
+                if has_learning:
+                    # 🔧 优化：第3次仍然使用学习参数，但加大抖动幅度以增加多样性
+                    selected_strategy = "learned_with_jitter"
+                    profile_name = "retry_learned_aggressive_jitter"
 
-                if selected_strategy == "aggressive":
-                    # 激进策略：大超调、少步数、快速
-                    strategy_config = ML_STRATEGY_CONFIG["strategies"]["aggressive"]
-                    overshoot_ratio = random.uniform(*strategy_config["overshoot_ratio"])
-                    steps = random.randint(*strategy_config["steps"])
-                    base_delay = random.uniform(*strategy_config["base_delay"])
-                    acceleration_curve = random.uniform(*strategy_config["acceleration_curve"])
-                    y_jitter_max = random.uniform(*strategy_config["y_jitter_max"])
+                    jitter_config = ML_STRATEGY_CONFIG.get("param_jitter", {})
+                    # 第3次使用更大的抖动幅度（原来的2倍）
+                    overshoot_jitter = jitter_config.get("overshoot_ratio_jitter", 0.05) * 2.0
+
+                    overshoot_ratio = random.uniform(effective_ranges["overshoot"][0], effective_ranges["overshoot"][1])
+                    overshoot_ratio *= random.uniform(1 - overshoot_jitter, 1 + overshoot_jitter)
+                    overshoot_ratio = max(1.01, min(bounds.get("max_overshoot_ratio", 1.18), overshoot_ratio))
+
+                    # 步数和延迟也加大变化范围
+                    steps_min = max(18, effective_ranges["steps"][0] - 3)
+                    steps_max = min(42, effective_ranges["steps"][1] + 5)
+                    steps = random.randint(steps_min, steps_max)
+
+                    delay_min = max(0.004, effective_ranges["delay"][0] * 0.85)
+                    delay_max = min(0.022, effective_ranges["delay"][1] * 1.5)
+                    base_delay = random.uniform(delay_min, delay_max)
+
+                    curve_min = max(1.2, effective_ranges["curve"][0] - 0.2)
+                    curve_max = min(2.6, effective_ranges["curve"][1] + 0.2)
+                    acceleration_curve = random.uniform(curve_min, curve_max)
+
+                    jitter_min = max(0.8, effective_ranges["jitter"][0] - 0.3)
+                    jitter_max = min(3.5, effective_ranges["jitter"][1] + 0.5)
+                    y_jitter_max = random.uniform(jitter_min, jitter_max)
+
+                    logger.info(
+                        f"【{self.pure_user_id}】🛟 第{attempt}次尝试，使用学习参数(大抖动): "
+                        f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                        f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                    )
                 else:
-                    # 标准策略：作为第3次后的稳态兜底
-                    strategy_config = ML_STRATEGY_CONFIG["strategies"]["standard"]
+                    rotation_strategies = ["aggressive", "standard"]
+                    rotation_idx = (attempt - slow_fallback_threshold) % len(rotation_strategies)
+                    selected_strategy = rotation_strategies[rotation_idx]
+                    profile_name = f"retry_rotation_{selected_strategy}"
+
+                    strategy_config = ML_STRATEGY_CONFIG["strategies"][selected_strategy]
                     overshoot_ratio = random.uniform(*strategy_config["overshoot_ratio"])
                     steps = random.randint(*strategy_config["steps"])
                     base_delay = random.uniform(*strategy_config["base_delay"])
                     acceleration_curve = random.uniform(*strategy_config["acceleration_curve"])
                     y_jitter_max = random.uniform(*strategy_config["y_jitter_max"])
 
-                logger.info(
-                    f"【{self.pure_user_id}】🛟 第{attempt}次尝试，轮换策略[{selected_strategy}]: "
-                    f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
-                    f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
-                )
+                    logger.info(
+                        f"【{self.pure_user_id}】🛟 第{attempt}次尝试，轮换策略[{selected_strategy}]: "
+                        f"超调{(overshoot_ratio-1)*100:.1f}%, 步数{steps}, "
+                        f"延迟{base_delay*1000:.1f}ms, 曲线^{acceleration_curve:.2f}"
+                    )
             elif attempt == 2 and has_learning:
                 selected_strategy = "learned_with_jitter"
                 profile_name = "retry_stabilized"
@@ -4969,10 +5010,10 @@ class XianyuSliderStealth:
 
                 # 如果不是第一次尝试，使用渐进式等待策略
                 if attempt > 1:
-                    # 🔧 2026-01-28 优化：重试前适当等待
-                    # 第2次等待2-3秒，第3次等待3-4秒
-                    base_delay = 2.0 + (attempt - 1) * 1.0  # 基础2秒，每次增加1秒
-                    retry_delay = random.uniform(base_delay, base_delay + 1.0)
+                    # 🔧 优化：增加重试间隔，降低反爬触发风险
+                    # 第2次等待4-6秒，第3次等待6-8秒
+                    base_delay = 4.0 + (attempt - 1) * 2.0  # 基础4秒，每次增加2秒
+                    retry_delay = random.uniform(base_delay, base_delay + 2.0)
                     logger.info(f"【{self.pure_user_id}】⏳ 等待{retry_delay:.1f}秒后重试...")
                     time.sleep(retry_delay)
 
@@ -5973,25 +6014,6 @@ class XianyuSliderStealth:
                 os.makedirs(user_data_dir, exist_ok=True)
                 logger.info(f"【{self.pure_user_id}】使用用户数据目录: {user_data_dir}")
             
-            # 设置浏览器启动参数
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--lang=zh-CN',  # 设置浏览器语言为中文
-                # 反检测增强参数
-                '--disable-infobars',
-                '--disable-extensions',
-                '--disable-popup-blocking',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-            ]
-            
             # 在启动Playwright之前，重新检查和设置浏览器路径
             # 确保使用正确的浏览器版本（避免版本不匹配问题）
             import sys
@@ -6000,7 +6022,7 @@ class XianyuSliderStealth:
                 # 如果是打包后的exe，检查exe同目录下的浏览器
                 exe_dir = Path(sys.executable).parent
                 playwright_dir = exe_dir / 'playwright'
-                
+
                 if playwright_dir.exists():
                     chromium_dirs = list(playwright_dir.glob('chromium-*'))
                     # 找到第一个完整的浏览器目录
@@ -6018,7 +6040,33 @@ class XianyuSliderStealth:
                             logger.info(f"【{self.pure_user_id}】已设置PLAYWRIGHT_BROWSERS_PATH: {playwright_dir}")
                             logger.info(f"【{self.pure_user_id}】使用浏览器版本: {chromium_dir.name}")
                             break
-            
+
+            # 🔧 关键修复：复用完整浏览器画像，与 captcha 验证流程保持一致
+            browser_features = self._get_random_browser_features()
+            self.browser_features = browser_features
+            self.profile_id = browser_features.get("profile_id", "unknown")
+            logger.info(f"【{self.pure_user_id}】密码登录使用浏览器画像: {self.profile_id}, "
+                       f"viewport: {browser_features['viewport_width']}x{browser_features['viewport_height']}, "
+                       f"scale: {browser_features['device_scale_factor']}")
+
+            # 设置浏览器启动参数（保持原始参数，之前有头模式正常工作）
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--lang=zh-CN',
+                '--disable-infobars',
+                '--disable-extensions',
+                '--disable-popup-blocking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+            ]
+
             # 启动浏览器
             playwright = sync_playwright().start()
             browser = None
@@ -6028,13 +6076,13 @@ class XianyuSliderStealth:
                     args=browser_args
                 )
                 context = browser.new_context(
-                    viewport={'width': 1980, 'height': 1024},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale='zh-CN',
+                    viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+                    user_agent=browser_features['user_agent'],
+                    locale=browser_features['locale'],
                     accept_downloads=True,
                     ignore_https_errors=True,
                     extra_http_headers={
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                        'Accept-Language': browser_features['accept_lang']
                     }
                 )
                 # 注入已有 Cookie（让浏览器不是全新空白状态，降低风控检测风险）
@@ -6079,31 +6127,36 @@ class XianyuSliderStealth:
                     user_data_dir,
                     headless=not show_browser,
                     args=browser_args,
-                    viewport={'width': 1980, 'height': 1024},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale='zh-CN',  # 设置浏览器区域为中文
+                    viewport={'width': browser_features['viewport_width'], 'height': browser_features['viewport_height']},
+                    user_agent=browser_features['user_agent'],
+                    locale=browser_features['locale'],
                     accept_downloads=True,
                     ignore_https_errors=True,
                     extra_http_headers={
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'  # 设置HTTP Accept-Language header为中文
+                        'Accept-Language': browser_features['accept_lang']
                     }
                 )
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
-            
+
             if not browser:
                 browser = context.browser
             page = context.new_page()
 
-            # 注入反检测脚本
-            stealth_js = """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-            window.chrome = { runtime: {} };
-            """
-            page.add_init_script(stealth_js)
+            # 有头模式使用轻量反检测脚本（完整脚本会覆盖 document.fonts / EventTarget /
+            # Performance.now / Date 等浏览器核心 API，导致页面白屏无法渲染）；
+            # 无头模式使用完整脚本以通过自动化检测。
+            if show_browser:
+                stealth_js = """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                window.chrome = { runtime: {} };
+                """
+                page.add_init_script(stealth_js)
+            else:
+                page.add_init_script(self._get_stealth_script(browser_features))
 
-            logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式）")
+            logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式，画像: {self.profile_id}）")
 
             try:
                 # 预访问：先访问闲鱼首页建立正常浏览历史（降低空白浏览器的风控风险）
@@ -6475,19 +6528,162 @@ class XianyuSliderStealth:
                     login_success, active_page, _ = self._probe_context_login_success(context, page)
                     if login_success:
                         logger.success(f"【{self.pure_user_id}】✅ 检测到已登录状态")
-                        
-                        # 获取Cookie
-                        cookies_dict = self._snapshot_context_cookies(context)
-                        if cookies_dict:
-                            self._log_cookie_snapshot_integrity(cookies_dict, "无 iframe 已登录场景")
-                            logger.success("✅ 登录成功！Cookie有效")
-                            return cookies_dict
 
-                        logger.error("❌ Cookie为空")
-                        return None
+                        # 🔧 刷新模式下验证 session 是否真的有效
+                        # 注入旧 Cookie 可能让前端显示"已登录"，但服务端 session 已过期
+                        if force_clean_context:
+                            logger.info(f"【{self.pure_user_id}】刷新模式：验证服务端Session是否有效...")
+                            try:
+                                verify_page = context.new_page()
+                                verify_resp = verify_page.goto(
+                                    "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/?jsv=2.7.2&appKey=34839810&type=originaljson&dataType=json&v=1.0&api=mtop.taobao.idlemessage.pc.login.token&sessionOption=AutoLoginOnly",
+                                    wait_until="domcontentloaded",
+                                    timeout=10000
+                                )
+                                verify_text = verify_page.content()
+                                verify_page.close()
+
+                                if "FAIL_SYS_SESSION_EXPIRED" in verify_text or "FAIL_SYS_USER_VALIDATE" in verify_text:
+                                    logger.warning(
+                                        f"【{self.pure_user_id}】服务端Session已过期，"
+                                        f"前端登录状态为假象，需要重新账密登录"
+                                    )
+                                    # 清除注入的旧 Cookie，强制刷新页面让登录 iframe 出现
+                                    context.clear_cookies()
+                                    page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=30000)
+                                    time.sleep(2)
+                                    # 重新查找 iframe，走正常登录流程
+                                    login_frame = None
+                                    found_login_form = False
+                                    for frame in page.frames:
+                                        if frame != page.main_frame:
+                                            try:
+                                                for selector in main_page_selectors:
+                                                    element = frame.query_selector(selector)
+                                                    if element and element.is_visible():
+                                                        login_frame = frame
+                                                        found_login_form = True
+                                                        logger.info(f"【{self.pure_user_id}】✓ 清除Cookie后找到登录iframe")
+                                                        break
+                                            except Exception:
+                                                continue
+                                        if found_login_form:
+                                            break
+
+                                    if not found_login_form:
+                                        logger.error(f"【{self.pure_user_id}】清除Cookie后仍未找到登录iframe")
+                                        return self._fail_login("Session过期且清除Cookie后未找到登录表单")
+                                    # 跳出当前分支，继续走下面的账密输入流程
+                                else:
+                                    logger.info(f"【{self.pure_user_id}】✅ 服务端Session验证通过，Cookie有效")
+                                    cookies_dict = self._snapshot_context_cookies(context)
+                                    if cookies_dict:
+                                        self._log_cookie_snapshot_integrity(cookies_dict, "无 iframe 已登录场景(Session已验证)")
+                                        logger.success("✅ 登录成功！Cookie有效且Session有效")
+                                        return cookies_dict
+                                    logger.error("❌ Cookie为空")
+                                    return None
+                            except Exception as verify_e:
+                                logger.warning(f"【{self.pure_user_id}】Session验证异常: {verify_e}，按Session过期处理")
+                                context.clear_cookies()
+                                page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=30000)
+                                time.sleep(2)
+                                login_frame = None
+                                found_login_form = False
+                                for frame in page.frames:
+                                    if frame != page.main_frame:
+                                        try:
+                                            for selector in main_page_selectors:
+                                                element = frame.query_selector(selector)
+                                                if element and element.is_visible():
+                                                    login_frame = frame
+                                                    found_login_form = True
+                                                    logger.info(f"【{self.pure_user_id}】✓ 异常处理后找到登录iframe")
+                                                    break
+                                        except Exception:
+                                            continue
+                                    if found_login_form:
+                                        break
+                                if not found_login_form:
+                                    return self._fail_login("Session验证异常且未找到登录表单")
+                        else:
+                            # 非刷新模式，直接返回Cookie
+                            cookies_dict = self._snapshot_context_cookies(context)
+                            if cookies_dict:
+                                self._log_cookie_snapshot_integrity(cookies_dict, "无 iframe 已登录场景")
+                                logger.success("✅ 登录成功！Cookie有效")
+                                return cookies_dict
+
+                            logger.error("❌ Cookie为空")
+                            return None
                     else:
-                        logger.error(f"【{self.pure_user_id}】❌ 未找到登录表单且未检测到已登录")
-                        return self._fail_login("未找到登录表单且未检测到已登录状态")
+                        # 持久化上下文可能因浏览器缓存导致页面处于"半登录"状态
+                        # 既没有登录 iframe，也没有已登录元素
+                        if not force_clean_context:
+                            logger.warning(
+                                f"【{self.pure_user_id}】持久化上下文页面状态异常（无iframe、无已登录态），"
+                                f"清除Cookie和缓存后重新加载..."
+                            )
+                            # 清除 Cookie，强制让页面恢复到未登录状态
+                            context.clear_cookies()
+                            # 清除浏览器缓存（localStorage/sessionStorage）
+                            try:
+                                page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }")
+                            except Exception:
+                                pass
+                            # 重新加载页面
+                            page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=30000)
+                            time.sleep(3)
+
+                            # 重新在主页面查找登录表单
+                            login_frame = None
+                            found_login_form = False
+                            for selector in main_page_selectors:
+                                try:
+                                    element = page.query_selector(selector)
+                                    if element and element.is_visible():
+                                        login_frame = page
+                                        found_login_form = True
+                                        logger.info(f"【{self.pure_user_id}】✓ 清除缓存后在主页面找到登录表单: {selector}")
+                                        break
+                                except Exception:
+                                    continue
+
+                            # 主页面没找到，在 iframe 中查找
+                            if not found_login_form:
+                                retry_iframes = page.query_selector_all('iframe')
+                                logger.info(f"【{self.pure_user_id}】清除缓存后找到 {len(retry_iframes)} 个 iframe")
+                                for idx, iframe in enumerate(retry_iframes):
+                                    try:
+                                        frame = iframe.content_frame()
+                                        if frame:
+                                            try:
+                                                frame.wait_for_selector('#fm-login-id', timeout=3000)
+                                            except Exception:
+                                                pass
+                                            for selector in ['#fm-login-id', 'input[name="fm-login-id"]',
+                                                             'input[placeholder*="手机号"]', 'input[placeholder*="邮箱"]']:
+                                                try:
+                                                    element = frame.query_selector(selector)
+                                                    if element and element.is_visible():
+                                                        login_frame = frame
+                                                        found_login_form = True
+                                                        logger.info(f"【{self.pure_user_id}】✓ 清除缓存后在Frame {idx} 找到登录iframe")
+                                                        break
+                                                except Exception:
+                                                    continue
+                                            if found_login_form:
+                                                break
+                                    except Exception:
+                                        continue
+
+                            if not found_login_form:
+                                logger.error(f"【{self.pure_user_id}】❌ 清除缓存后仍未找到登录表单")
+                                return self._fail_login("持久化上下文清除缓存后仍未找到登录表单")
+                            # found_login_form=True → 继续走下面的账密输入流程
+                        else:
+                            logger.error(f"【{self.pure_user_id}】❌ 未找到登录表单且未检测到已登录")
+                            return self._fail_login("未找到登录表单且未检测到已登录状态")
                 
                 # 点击密码登录标签
                 logger.info(f"【{self.pure_user_id}】查找密码登录标签...")
